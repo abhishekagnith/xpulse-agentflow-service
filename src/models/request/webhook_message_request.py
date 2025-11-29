@@ -6,15 +6,17 @@ class WebhookMessageRequest(BaseModel):
     """
     Request model for incoming webhook messages from channel services.
     This model is channel-agnostic and can be used by WhatsApp, Telegram, SMS, etc.
+    Also supports system webhooks (delay_complete, scheduled_trigger).
+    For system webhooks, use sender="system" and channel="system".
     """
-    sender: str = Field(..., description="User identifier (phone number, user ID, etc.)")
+    sender: str = Field(..., description="User identifier (phone number, user ID, etc.) or 'system' for system webhooks")
     brand_id: int = Field(..., description="Brand ID for multitenancy")
     user_id: int = Field(..., description="User ID for multitenancy")
-    channel_identifier: str = Field(..., description="Channel-specific identifier (WABA ID, Bot ID, etc.)")
+    channel_identifier: Optional[str] = Field(None, description="Channel-specific identifier (WABA ID, Bot ID, etc.). None for system webhooks")
     channel_phone_number_id: Optional[str] = Field(None, description="Channel phone number ID (for WhatsApp)")
-    message_type: str = Field(..., description="Type of message (text, button, interactive, etc.)")
-    message_body: Dict[str, Any] = Field(..., description="Message content/payload")
-    channel: str = Field(default="whatsapp", description="Channel name (whatsapp, telegram, sms, etc.)")
+    message_type: str = Field(..., description="Type of message (text, button, interactive, delay_complete, scheduled_trigger, etc.)")
+    message_body: Dict[str, Any] = Field(..., description="Message content/payload or system event data")
+    channel: str = Field(default="whatsapp", description="Channel name (whatsapp, telegram, sms, system, etc.)")
     
     class Config:
         json_schema_extra = {

@@ -1,5 +1,5 @@
 from typing import Optional, Dict, Any, List
-import httpx
+from datetime import datetime, timedelta
 
 # Utils
 from utils.log_utils import LogUtil
@@ -9,12 +9,17 @@ from database.flow_db import FlowDB
 
 # Services
 from services.flow_service import FlowService
+from services.whatsapp_flow_service import WhatsAppFlowService
+from services.node_identification_service import NodeIdentificationService
+from services.reply_validation_service import ReplyValidationService
+from services.lead_management_service import LeadManagementService
+from services.lead_management_service import LeadManagementService
 
 # Models
 from models.user_data import UserData
 from models.flow_data import FlowData
-from models.request.process_node_request import ProcessNodeRequest
-from models.response.process_node_response import ProcessNodeResponse
+from models.user_detail import UserDetail
+from models.webhook_message_data import WebhookMetadata
 
 
 class UserStateService:
@@ -25,973 +30,725 @@ class UserStateService:
         flow_service: Optional[FlowService] = None,
         node_process_service: Optional[Any] = None,  # Channel-specific, made optional
         node_process_api_url: Optional[str] = None,  # API endpoint URL
+        node_identification_service: Optional[NodeIdentificationService] = None,  # Node identification service
+        reply_validation_service: Optional[ReplyValidationService] = None,  # Reply validation service
+        lead_management_service: Optional[LeadManagementService] = None,  # Lead management service
     ):
         self.log_util = log_util
         self.flow_db = flow_db
         self.flow_service = flow_service
         self.node_process_service = node_process_service  # Kept for backward compatibility, but will use API
-        # Default to localhost, but can be overridden for different deployments
-        self.node_process_api_url = node_process_api_url or "http://localhost:8017/whatsapp/node/process"
-
-    async def update_user_automation_state_after_message(
-        self, 
-        user_phone_number: str, 
-        brand_id: int, 
-        flow_id: str, 
-        next_node_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Update WhatsApp user table with automation state after successful message send
-        Returns updated user state JSON or None
-        """
-        try:
-            # Update user automation state with next node
-            updated_user = await self.flow_db.update_user_automation_state(
-                user_identifier=user_phone_number,
-                brand_id=brand_id,
-                is_in_automation=True,
-                current_flow_id=flow_id,
-                current_node_id=next_node_id
+        self.trigger_identification_service = None  # Will be set via setter to avoid circular dependency
+        # Initialize WhatsAppFlowService for channel-specific operations
+        self.whatsapp_flow_service = WhatsAppFlowService(
+            log_util=log_util,
+            flow_db=flow_db,
+            node_process_api_url=node_process_api_url
+        )
+        # Initialize ReplyValidationService if not provided
+        if reply_validation_service:
+            self.reply_validation_service = reply_validation_service
+        else:
+            self.reply_validation_service = ReplyValidationService(
+                log_util=log_util,
+                flow_db=flow_db
             )
-            
-            if updated_user:
-                self.log_util.info(
-                    service_name="WhatsAppUserStateService",
-                    message=f"Updated user automation state: flow_id={flow_id}, current_node_id={next_node_id} for {user_phone_number}"
-                )
-                return updated_user.model_dump()
-            else:
-                self.log_util.warning(
-                    service_name="WhatsAppUserStateService",
-                    message=f"Failed to update user automation state for {user_phone_number}"
-                )
-                return None
-                
-        except Exception as e:
-            self.log_util.error(
-                service_name="WhatsAppUserStateService",
-                message=f"Error updating user automation state: {str(e)}"
+        # Initialize NodeIdentificationService if not provided
+        if node_identification_service:
+            self.node_identification_service = node_identification_service
+        else:
+            self.node_identification_service = NodeIdentificationService(
+                log_util=log_util,
+                flow_db=flow_db,
+                whatsapp_flow_service=self.whatsapp_flow_service
             )
-            return None
-
-    def _extract_user_input(self, message_type: str, message_body: Dict[str, Any]) -> Optional[str]:
-        """
-        Extract user input from different message types.
-        """
-        user_input = None
-        if message_type == "button" and "button" in message_body:
-            user_input = message_body["button"].get("text", message_body["button"].get("payload", ""))
-        elif message_type == "text" and "text" in message_body:
-            user_input = message_body["text"].get("body", "")
-        elif message_type == "interactive" and "interactive" in message_body:
-            interactive_data = message_body.get("interactive", {})
-            if interactive_data.get("type") == "button_reply":
-                button_reply = interactive_data.get("button_reply", {})
-                user_input = button_reply.get("title", button_reply.get("id", ""))
-            elif interactive_data.get("type") == "list_reply":
-                list_reply = interactive_data.get("list_reply", {})
-                user_input = list_reply.get("title", list_reply.get("id", ""))
-        return user_input
-
-    async def process_reply_match(
+        # Initialize LeadManagementService if not provided
+        if lead_management_service:
+            self.lead_management_service = lead_management_service
+        else:
+            self.lead_management_service = LeadManagementService(
+                log_util=log_util
+            )
+    
+    def set_trigger_identification_service(self, trigger_identification_service):
+        """Set the trigger identification service (called after initialization to avoid circular dependency)"""
+        self.trigger_identification_service = trigger_identification_service
+    
+    async def _process_validation_and_get_node_service_params(
         self,
-        source_node: Dict[str, Any],
-        message_type: str,
-        message_body: Dict[str, Any],
-        edges: List[Any]
-    ) -> Optional[str]:
-        """
-        Process when user reply matches the current node's expected answers in list and button questions.
-        Returns the next_node_id if a match is found, None otherwise.
-        """
-        try:
-            node_type = source_node.get("type")
-            
-            # Only process nodes that have expected answers
-            if node_type not in ("trigger_template", "button_question", "list_question"):
-                return None
-            
-            expected_answers = source_node.get("expectedAnswers", [])
-            if not expected_answers:
-                return None
-            
-            # Extract user input from different message types
-            user_input = self._extract_user_input(message_type, message_body)
-            if not user_input:
-                return None
-            
-            # Match user input to expected answers
-            for answer in expected_answers:
-                expected_input = answer.get("expectedInput", "")
-                if expected_input and expected_input.lower() == user_input.lower():
-                    # Find the edge that connects from this answer to the next node
-                    answer_id = answer.get("id")
-                    for edge in edges:
-                        if edge.source_node_id == answer_id:
-                            return edge.target_node_id
-            
-            return None
-        except Exception as e:
-            self.log_util.error(
-                service_name="WhatsAppUserStateService",
-                message=f"Error processing reply match: {str(e)}"
-            )
-            return None
-
-    async def _handle_question_node_reply(
-        self,
-        question_node: Dict[str, Any],
-        message_type: str,
-        message_body: Dict[str, Any],
-        user_phone_number: str,
+        metadata: "WebhookMetadata",
+        data: Dict[str, Any],
+        existing_user: "UserData",
+        flow: "FlowData",
+        current_node: Dict[str, Any],
+        node_type: str,
+        is_text: bool,
+        sender: str,
         brand_id: int,
-        flow_id: str,
-        node_id: str
-    ) -> bool:
+        channel: str,
+        channel_account_id: Optional[str]
+    ) -> Dict[str, Any]:
         """
-        Handle user reply to a question node.
-        ONLY extracts user's answer and saves to flow context table as a separate record.
-        Does NOT change user state or find next node.
+        Process validation service call and return parameters for node identification service.
         
-        Returns:
-            bool: True if answer was saved successfully, False otherwise
-        """
-        try:
-            # Extract user's answer
-            user_answer = self._extract_user_input(message_type, message_body)
-            
-            if not user_answer:
-                self.log_util.warning(
-                    service_name="WhatsAppUserStateService",
-                    message=f"Could not extract user answer from message for user {user_phone_number}"
-                )
-                user_answer = ""
-            
-            print(f"DEBUG: Extracted user answer: '{user_answer}'")
-            
-            # Get the variable name to store the answer
-            user_input_variable = question_node.get("userInputVariable", "")
-            
-            # Only save if userInputVariable is provided
-            if not user_input_variable:
-                print(f"DEBUG: No userInputVariable defined, skipping save")
-                self.log_util.info(
-                    service_name="WhatsAppUserStateService",
-                    message=f"Question node has no userInputVariable, skipping answer save for user {user_phone_number}"
-                )
-                return True
-            
-            print(f"DEBUG: Saving variable '{user_input_variable}' = '{user_answer}' as separate record")
-            
-            # Save this variable as its own record
-            await self.flow_db.save_or_update_flow_variable(
-                user_identifier=user_phone_number,
-                brand_id=brand_id,
-                flow_id=flow_id,
-                variable_name=user_input_variable,
-                variable_value=user_answer,
-                node_id=node_id
-            )
-            
-            print(f"DEBUG: Flow variable saved as new record in DB successfully")
-            self.log_util.info(
-                service_name="WhatsAppUserStateService",
-                message=f"Saved user answer '{user_answer}' to {user_input_variable} (node: {node_id}) for user {user_phone_number} in flow {flow_id}"
-            )
-            return True
-            
-        except Exception as e:
-            self.log_util.error(
-                service_name="WhatsAppUserStateService",
-                message=f"Error handling question node reply: {str(e)}"
-            )
-            return False
-
-    async def _call_node_process_api(
-        self,
-        flow: FlowData,
-        current_node_id: str,
-        next_node_id: str,
-        next_node_data: Dict[str, Any],
-        user_identifier: str,
-        brand_id: int,
-        user_id: int,
-        channel: str = "whatsapp",
-        fallback_message: Optional[str] = None,
-        user_state: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        Call the node process API endpoint to send node to channel service
-        """
-        try:
-            # Convert datetime objects in user_state to strings for JSON serialization
-            serializable_user_state = None
-            if user_state:
-                import json
-                from datetime import datetime
-                serializable_user_state = {}
-                for key, value in user_state.items():
-                    if isinstance(value, datetime):
-                        serializable_user_state[key] = value.isoformat()
-                    else:
-                        serializable_user_state[key] = value
-            
-            request_data = ProcessNodeRequest(
-                flow_id=flow.id,
-                current_node_id=current_node_id,
-                next_node_id=next_node_id,
-                next_node_data=next_node_data,
-                user_identifier=user_identifier,
-                brand_id=brand_id,
-                user_id=user_id,
-                channel=channel,
-                fallback_message=fallback_message,
-                user_state=serializable_user_state
-            )
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    self.node_process_api_url,
-                    json=request_data.model_dump(mode='json'),
-                    headers={"Content-Type": "application/json"}
-                )
-                
-                if response.status_code == 200:
-                    response_data = response.json()
-                    return ProcessNodeResponse(**response_data).model_dump()
-                else:
-                    self.log_util.error(
-                        service_name="UserStateService",
-                        message=f"Node process API returned error: {response.status_code} - {response.text}"
-                    )
-                    return {
-                        "status": "error",
-                        "message": f"Node process API error: {response.text}",
-                        "flow_id": flow.id,
-                        "next_node_id": next_node_id,
-                        "automation_exited": False
-                    }
-                    
-        except httpx.TimeoutException:
-            self.log_util.error(
-                service_name="UserStateService",
-                message=f"Timeout calling node process API"
-            )
-            return {
-                "status": "error",
-                "message": "Timeout calling node process API",
-                "flow_id": flow.id,
-                "next_node_id": next_node_id,
-                "automation_exited": False
-            }
-        except Exception as e:
-            self.log_util.error(
-                service_name="UserStateService",
-                message=f"Error calling node process API: {str(e)}"
-            )
-            return {
-                "status": "error",
-                "message": f"Error calling node process API: {str(e)}",
-                "flow_id": flow.id,
-                "next_node_id": next_node_id,
-                "automation_exited": False
-            }
-
-    async def _check_and_handle_validation(
-        self,
-        current_node_id: str,
-        next_node_id: str,
-        current_node_data: Dict[str, Any],
-        user_state: Dict[str, Any],
-        user_identifier: str,
-        brand_id: int,
-        user_id: int,
-        channel: str = "whatsapp"
-    ) -> Dict[str, Any]:
-        """
-        Check validation count when reply doesn't match expected answers.
-        Applies when current_node_id == next_node_id (retry scenario) OR when no match found anywhere.
+        This function:
+        1. Calls validation service with current node and user reply
+        2. Handles validation_exit case (exits automation and returns early)
+        3. Returns parameters needed to call node identification service
+        
+        Args:
+            metadata: WebhookMetadata from saved webhook
+            data: Normalized data from saved webhook
+            existing_user: Current user data
+            flow: Flow data
+            current_node: Current node data
+            node_type: Current node type
+            is_text: Whether node is text question type
+            sender: User identifier
+            brand_id: Brand ID
+            channel: Channel name
+            channel_account_id: Channel account ID
         
         Returns:
             Dict with:
-                - should_process: bool - Whether to process the node normally
-                - should_exit: bool - Whether to exit automation
-                - validation_count: int - Updated validation count
-                - fallback_message: Optional[str] - Fallback message to send
+                - handled: bool - True if validation_exit was handled (automation exited), False if node service should be called
+                - is_validation_error: bool - Whether validation failed
+                - fallback_message: Optional[str] - Fallback message for validation errors
+                - node_id_to_process: Optional[str] - Node ID to process (for matched_other_node or retry)
+                - current_node_id_for_service: str - Current node ID to use for node service (may be matched_answer_id)
+                - validation_result: Dict[str, Any] - Validation result for later use
         """
-        # Check if current_node_id == next_node_id (retry scenario)
-        if current_node_id != next_node_id:
-            # Different nodes - normal flow, reset validation count
-            # Reset validation on successful progression
-            await self.flow_db.update_validation_state(
-                user_identifier=user_identifier,
-                brand_id=brand_id,
-                validation_failed=False,
-                failure_message=None
-            )
-            return {
-                "should_process": True,
-                "should_exit": False,
-                "validation_count": 0,
-                "fallback_message": None
-            }
-        
-        # Same node - retry scenario, check validation count
-        # Get fallback count from current node (default 3)
-        max_fallback_count = 3
-        answer_validation = current_node_data.get("answerValidation")
-        
-        if answer_validation:
-            if isinstance(answer_validation, dict):
-                fails_count_str = answer_validation.get("failsCount", "3")
-            else:
-                fails_count_str = getattr(answer_validation, "failsCount", "3")
-            
-            try:
-                max_fallback_count = int(fails_count_str) if fails_count_str else 3
-            except (ValueError, TypeError):
-                max_fallback_count = 3
-        
-        # Get current validation count from user state
-        current_validation_count = user_state.get("validation_failure_count", 0)
-        
-        # Get fallback message from node or use default
-        fallback_message = "This is not the valid response. Please try again below"
-        if answer_validation:
-            if isinstance(answer_validation, dict):
-                node_fallback = answer_validation.get("fallback", "")
-            else:
-                node_fallback = getattr(answer_validation, "fallback", "")
-            
-            if node_fallback and node_fallback.strip():
-                fallback_message = node_fallback.strip()
-        
-        # Check if within limit
-        if current_validation_count < max_fallback_count:
-            # Within limit - increment validation count and allow retry
-            await self.flow_db.update_validation_state(
-                user_identifier=user_identifier,
-                brand_id=brand_id,
-                validation_failed=True,
-                failure_message=fallback_message
-            )
-            
-            self.log_util.info(
-                service_name="UserStateService",
-                message=f"Validation failure {current_validation_count + 1}/{max_fallback_count} for user {user_identifier} on node {current_node_id}"
-            )
-            
-            return {
-                "should_process": True,
-                "should_exit": False,
-                "validation_count": current_validation_count + 1,
-                "fallback_message": fallback_message
-            }
-        else:
-            # Exceeded limit - exit automation
-            error_message = "We cannot currently process your request. Please try again later"
-            
-            # Exit automation
-            await self.flow_db.update_user_automation_state(
-                user_identifier=user_identifier,
-                brand_id=brand_id,
-                is_in_automation=False,
-                current_flow_id=None,
-                current_node_id=None
-            )
-            
-            # Reset validation state
-            await self.flow_db.update_validation_state(
-                user_identifier=user_identifier,
-                brand_id=brand_id,
-                validation_failed=False,
-                failure_message=None
-            )
-            
-            self.log_util.warning(
-                service_name="UserStateService",
-                message=f"Validation limit exceeded ({current_validation_count}/{max_fallback_count}) for user {user_identifier}, exiting automation"
-            )
-            
-            return {
-                "should_process": False,
-                "should_exit": True,
-                "validation_count": current_validation_count,
-                "fallback_message": error_message
-            }
-
-
-    async def find_next_node_details(
-        self,
-        flow: FlowData,
-        source_node_id: str,
-        message_type: str,
-        message_body: Dict[str, Any],
-        user_phone_number: str,
-        brand_id: int,
-        user_id: int,
-        existing_user: UserData
-    ) -> Dict[str, Any]:
-        """
-        Orchestrator function that:
-        1. Calls reply match/mismatch to identify next node
-        2. Calls process_flow_node with node JSON, fallback message, and user state
-        3. Returns success/failure with updated user state JSON
-        """
-        def _node_to_dict(node: Any) -> Dict[str, Any]:
-            if hasattr(node, "model_dump"):
-                return node.model_dump()
-            if isinstance(node, dict):
-                return node
-            return dict(node)
-
         try:
             self.log_util.info(
                 service_name="UserStateService",
-                message=f"[FIND_NEXT_NODE] Starting find_next_node_details for user {user_phone_number}, flow_id: {flow.id}, source_node_id: {source_node_id}"
-            )
-            # Get edges
-            edges = await self.flow_db.get_flow_edges(flow.id)
-            self.log_util.info(
-                service_name="UserStateService",
-                message=f"[FIND_NEXT_NODE] Retrieved {len(edges) if edges else 0} edges for flow {flow.id}"
-            )
-            if not edges:
-                self.log_util.error(
-                    service_name="UserStateService",
-                    message=f"[FIND_NEXT_NODE] ❌ No edges found for flow {flow.id}"
-                )
-                return {
-                    "status": "error",
-                    "message": "No edges found for flow",
-                    "user_state": None
-                }
-
-            # Get source node
-            source_node = None
-            for node in flow.flowNodes:
-                node_dict = _node_to_dict(node)
-                if node_dict.get("id") == source_node_id:
-                    source_node = node_dict
-                    break
-
-            if not source_node:
-                return {
-                    "status": "error",
-                    "message": f"Source node {source_node_id} not found",
-                    "user_state": None
-                }
-
-            node_type = source_node.get("type")
-            
-            # STEP 0: Special handling for question nodes - save user answer and continue
-            if node_type == "question":
-                print(f"\n{'='*80}")
-                print(f"DEBUG: Source node is QUESTION type, saving answer to flow_context")
-                print(f"Question Node ID: {source_node_id}")
-                print(f"{'='*80}\n")
-                
-                # Save user's answer to flow_context (doesn't change user state)
-                answer_saved = await self._handle_question_node_reply(
-                    question_node=source_node,
-                    message_type=message_type,
-                    message_body=message_body,
-                    user_phone_number=user_phone_number,
-                    brand_id=brand_id,
-                    flow_id=flow.id,
-                    node_id=source_node_id
-                )
-                
-                if not answer_saved:
-                    self.log_util.warning(
-                        service_name="WhatsAppUserStateService",
-                        message=f"Failed to save question answer for user {user_phone_number}"
-                    )
-                
-                print(f"DEBUG: Answer saved, now finding next node via default edge...")
-                # Continue with normal flow - find default edge and process next node
-                # Fall through to find next node using default edge logic
-            
-            # STEP 1: Try to match reply with expected answers
-            matched_next_node_id = await self.process_reply_match(
-                source_node=source_node,
-                message_type=message_type,
-                message_body=message_body,
-                edges=edges
+                message=f"[EXISTING_USER] Current node has expected reply, calling validation service"
             )
             
-            next_node_id = None
-            next_node_data = None
-            fallback_message = None
-            should_update_validation = False
-            
-            # STEP 2: Determine flow based on match/mismatch
-            if matched_next_node_id:
-                # ✅ REPLY MATCHED
-                next_node_id = matched_next_node_id
-                
-                # Get next node data
-                for node in flow.flowNodes:
-                    node_dict = _node_to_dict(node)
-                    if node_dict.get("id") == next_node_id:
-                        next_node_data = node_dict
-                        break
-
-            else:
-                # ❌ REPLY DID NOT MATCH
-                # ALWAYS check if reply matches any button/list node in flow (even from message nodes)
-                mismatch_result = await self._handle_reply_mismatch_internal(
-                    flow=flow,
-                    current_node=source_node,
-                    message_type=message_type,
-                    message_body=message_body,
-                    user_phone_number=user_phone_number,
-                    brand_id=brand_id,
-                    user_id=user_id,
-                    existing_user=existing_user,
-                    edges=edges
-                )
-                
-                if mismatch_result["status"] == "handled":
-                    # Mismatch was fully handled (matched other node or sent error)
-                    return mismatch_result
-                elif node_type in ("button_question", "list_question"):
-                    # For button/list questions, retry current node with fallback
-                    next_node_id = source_node_id
-                    next_node_data = source_node
-                    fallback_message = mismatch_result.get("fallback_message")
-                    
-                    # ⭐ CHECK VALIDATION - Reply didn't match, check validation count
-                    user_state_dict = existing_user.model_dump() if existing_user else {}
-                    validation_result = await self._check_and_handle_validation(
-                        current_node_id=source_node_id,
-                        next_node_id=next_node_id,
-                        current_node_data=source_node,
-                        user_state=user_state_dict,
-                        user_identifier=user_phone_number,
-                        brand_id=brand_id,
-                        user_id=user_id,
-                        channel="whatsapp"  # TODO: Get channel from context
-                    )
-                    
-                    if validation_result["should_exit"]:
-                        # Validation limit exceeded - exit automation
-                        self.log_util.warning(
-                            service_name="UserStateService",
-                            message=f"Validation limit exceeded for user {user_phone_number}, exiting automation"
-                        )
-                        # Send exit message via node process API
-                        if validation_result.get("fallback_message"):
-                            try:
-                                # Create a simple message node for exit message
-                                exit_node_data = {
-                                    "id": "exit_message",
-                                    "type": "message",
-                                    "flowReplies": [{
-                                        "flowReplyType": "text",
-                                        "data": validation_result["fallback_message"]
-                                    }]
-                                }
-                                await self._call_node_process_api(
-                                    flow=flow,
-                                    current_node_id=source_node_id,
-                                    next_node_id="exit_message",
-                                    next_node_data=exit_node_data,
-                                    user_identifier=user_phone_number,
-                                    brand_id=brand_id,
-                                    user_id=user_id,
-                                    channel="whatsapp",  # TODO: Get channel from context
-                                    fallback_message=None,
-                                    user_state=user_state_dict
-                                )
-                            except Exception as e:
-                                self.log_util.error(
-                                    service_name="UserStateService",
-                                    message=f"Error sending exit message: {str(e)}"
-                                )
-                        
-                        # Get updated user state
-                        updated_user = await self.flow_db.get_user_data(
-                            user_identifier=user_phone_number,
-                            brand_id=brand_id
-                        )
-                        return {
-                            "status": "validation_exit",
-                            "message": "Validation limit exceeded, automation exited",
-                            "user_state": updated_user.model_dump() if updated_user else None
-                        }
-                    
-                    # Update fallback message from validation result
-                    if validation_result.get("fallback_message"):
-                        fallback_message = validation_result["fallback_message"]
-                    
-                    # Refresh user state after validation update
-                    existing_user = await self.flow_db.get_user_data(
-                        user_phone_number=user_phone_number,
-                        brand_id=brand_id
-                    )
-                    user_state_dict = existing_user.model_dump() if existing_user else {}
-                    
+            # Get current validation count from user state
+            current_validation_count = 0
+            if existing_user.validation:
+                if isinstance(existing_user.validation, dict):
+                    current_validation_count = existing_user.validation.get("failure_count", 0)
                 else:
-                    # For other node types (message, question, etc.), use default edge
-                    self.log_util.info(
-                        service_name="UserStateService",
-                        message=f"[FIND_NEXT_NODE] Looking for default edge from source_node_id: {source_node_id} (node_type: {node_type})"
-                    )
-                    for edge in edges:
-                        self.log_util.info(
-                            service_name="UserStateService",
-                            message=f"[FIND_NEXT_NODE] Checking edge: source={edge.source_node_id}, target={edge.target_node_id}"
-                        )
-                        if edge.source_node_id == source_node_id:
-                            next_node_id = edge.target_node_id
-                            self.log_util.info(
-                                service_name="UserStateService",
-                                message=f"[FIND_NEXT_NODE] ✅ Found default edge: {source_node_id} -> {next_node_id}"
-                            )
-                            break
-                    
-                    if next_node_id:
-                        self.log_util.info(
-                            service_name="UserStateService",
-                            message=f"[FIND_NEXT_NODE] Looking for next node data for node_id: {next_node_id}"
-                        )
-                        for node in flow.flowNodes:
-                            node_dict = _node_to_dict(node)
-                            if node_dict.get("id") == next_node_id:
-                                next_node_data = node_dict
-                                self.log_util.info(
-                                    service_name="UserStateService",
-                                    message=f"[FIND_NEXT_NODE] ✅ Found next node data: type={node_dict.get('type')}, id={next_node_id}"
-                                )
-                                break
-                    else:
-                        self.log_util.error(
-                            service_name="UserStateService",
-                            message=f"[FIND_NEXT_NODE] ❌ No default edge found from source_node_id: {source_node_id}. Available edges: {[(e.source_node_id, e.target_node_id) for e in edges]}"
-                        )
-
-            # STEP 3: Process the node if we have next node details
-            if not next_node_id or not next_node_data:
-                self.log_util.error(
-                    service_name="UserStateService",
-                    message=f"[FIND_NEXT_NODE] ❌ No next node found: next_node_id={next_node_id}, next_node_data={next_node_data is not None}"
-                )
-                return {
-                    "status": "error",
-                    "message": "No next node found",
-                    "user_state": None
-                }
+                    current_validation_count = existing_user.validation.failure_count if hasattr(existing_user.validation, "failure_count") else 0
             
+            # Log data being passed to validation service for debugging
             self.log_util.info(
                 service_name="UserStateService",
-                message=f"[FIND_NEXT_NODE] Calling node process API: current_node_id={source_node_id}, next_node_id={next_node_id}, node_type={next_node_data.get('type') if next_node_data else None}"
+                message=f"[EXISTING_USER] Data passed to validation service - keys: {list(data.keys()) if data else 'None'}, user_reply: '{data.get('user_reply') if data else None}', full_data: {data}"
             )
-            # STEP 3: Call node process API to send node to channel service
-            user_state_dict = existing_user.model_dump() if existing_user else {}
-            node_result = await self._call_node_process_api(
-                    flow=flow,
-                    current_node_id=source_node_id,
-                    next_node_id=next_node_id,
-                    next_node_data=next_node_data,
-                user_identifier=user_phone_number,
-                brand_id=brand_id,
-                user_id=user_id,
-                channel="whatsapp",  # TODO: Get channel from context or user state
-                    fallback_message=fallback_message,
-                user_state=user_state_dict
-                )
-            self.log_util.info(
-                service_name="UserStateService",
-                message=f"[FIND_NEXT_NODE] Node process API returned: status={node_result.get('status')}, message={node_result.get('message')}, automation_exited={node_result.get('automation_exited')}"
-            )
-                
-            # Check if automation was exited (shouldn't happen from API, but handle it)
-            if node_result.get("automation_exited") or node_result.get("status") == "validation_exit":
-                self.log_util.info(
-                    service_name="UserStateService",
-                    message=f"Automation exited for user {user_phone_number}"
-                )
-                # Get updated user state from DB
-                updated_user = await self.flow_db.get_user_data(
-                    user_identifier=user_phone_number,
-                    brand_id=brand_id
-                )
-                return {
-                    "status": "validation_exit",
-                    "message": node_result.get("message", "Automation exited"),
-                    "user_state": updated_user.model_dump() if updated_user else None
-                }
-                
-            # Check if node processing was successful
-            if node_result.get("status") != "success":
-                return {
-                    "status": "error",
-                    "message": node_result.get("message", "Node processing failed"),
-                    "user_state": None
-                }
             
-            # STEP 4: Update user state after successful node processing
-            self.log_util.info(
-                service_name="UserStateService",
-                message=f"[FIND_NEXT_NODE] Updating user automation state: flow_id={flow.id}, next_node_id={next_node_id}"
-            )
-            updated_user_state = await self.update_user_automation_state_after_message(
-                user_phone_number=user_phone_number,
-                brand_id=brand_id,
+            validation_result = await self.reply_validation_service.validate_and_match_reply(
+                metadata=metadata,
+                data=data,
+                current_node_id=existing_user.current_node_id,
                 flow_id=flow.id,
-                next_node_id=next_node_id
+                is_text=is_text,
+                current_validation_count=current_validation_count
             )
-            if updated_user_state:
+            
+            # Log validation result for debugging
+            self.log_util.info(
+                service_name="UserStateService",
+                message=f"[EXISTING_USER] Validation result: status={validation_result.get('status')}, matched_answer_id={validation_result.get('matched_answer_id')}, matched_node_id={validation_result.get('matched_node_id')}"
+            )
+            
+            # Handle validation_exit case - send error message but keep automation active
+            if validation_result["status"] == "validation_exit":
+                # Validation limit exceeded - send error message but DON'T exit automation
+                # User can still send correct message to proceed (validation will pass if correct)
+                self.log_util.warning(
+                    service_name="UserStateService",
+                    message=f"[EXISTING_USER] Validation limit exceeded for user {sender}, sending error message but keeping automation active. User can still send correct message."
+                )
+                
+                # Get fallback message from validation result
+                fallback_message = validation_result.get("fallback_message")
+                
+                # Call node service with validation error to send error message only
+                user_detail_dict = existing_user.user_detail.model_dump() if existing_user.user_detail else None
+                node_service_response = await self.node_identification_service.identify_and_process_node(
+                    metadata=metadata,
+                    data=data,
+                    is_validation_error=True,
+                    fallback_message=fallback_message,
+                    node_id_to_process=None,
+                    current_node_id=existing_user.current_node_id,
+                    flow_id=flow.id,
+                    user_detail=user_detail_dict,
+                    lead_id=existing_user.lead_id if existing_user else None
+                )
+                
+                # DON'T exit automation - keep is_in_automation=True and validation count
+                # DON'T update user state - keep current_node_id and validation count as is
+                # User can still send correct message to proceed
+                # Return handled=True to return early (don't process any node)
+                return {
+                    "handled": True,  # Return early, don't process any node
+                    "validation_exit": True,
+                    "node_service_response": node_service_response
+                }
+            
+            # Determine parameters for node service
+            is_validation_error = False
+            fallback_message = None
+            node_id_to_process = None
+            
+            if validation_result["status"] == "matched":
+                # Reply matched expected answer
+                is_validation_error = False
+                fallback_message = None
+                node_id_to_process = None
+                
+            elif validation_result["status"] == "matched_other_node":
+                # Reply matched another node in the flow
+                is_validation_error = False
+                fallback_message = None
+                node_id_to_process = validation_result.get("matched_node_id")
+                
+            elif validation_result["status"] == "mismatch_retry":
+                # Reply didn't match, retry current node with fallback
+                is_validation_error = True
+                fallback_message = validation_result.get("fallback_message")
+                node_id_to_process = existing_user.current_node_id  # Retry same node
+                
+            else:
+                # use_default_edge or other status
+                is_validation_error = False
+                fallback_message = None
+                node_id_to_process = None
+            
+            # Determine current_node_id_for_service
+            # For matched status, use matched_answer_id as current_node_id
+            current_node_id_for_service = existing_user.current_node_id
+            if validation_result["status"] == "matched":
+                matched_answer_id = validation_result.get("matched_answer_id")
                 self.log_util.info(
                     service_name="UserStateService",
-                    message=f"[FIND_NEXT_NODE] ✅ User state updated successfully: is_in_automation={updated_user_state.get('is_in_automation')}, current_flow_id={updated_user_state.get('current_flow_id')}, current_node_id={updated_user_state.get('current_node_id')}"
+                    message=f"[EXISTING_USER] Status is 'matched', matched_answer_id={matched_answer_id}, original current_node_id={existing_user.current_node_id}"
+                )
+                if not matched_answer_id:
+                    self.log_util.error(
+                        service_name="UserStateService",
+                        message=f"[EXISTING_USER] Status is 'matched' but matched_answer_id is None/empty. Cannot proceed without matched_answer_id."
+                    )
+                    return {
+                        "handled": False,
+                        "is_validation_error": False,
+                        "fallback_message": None,
+                        "node_id_to_process": None,
+                        "current_node_id_for_service": None,
+                        "validation_result": validation_result,
+                        "error": "matched_answer_id is required for 'matched' status but is None/empty"
+                    }
+                current_node_id_for_service = matched_answer_id
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"[EXISTING_USER] ✅ Using matched_answer_id as current_node_id_for_service: {current_node_id_for_service}"
                 )
             else:
-                self.log_util.error(
+                self.log_util.info(
                     service_name="UserStateService",
-                    message=f"[FIND_NEXT_NODE] ❌ Failed to update user state"
+                    message=f"[EXISTING_USER] Status is '{validation_result.get('status')}', using original current_node_id: {current_node_id_for_service}"
                 )
             
-            print(f"\n{'='*80}")
-            print(f"DEBUG: Reached STEP 4.5 - Chaining Logic")
-            print(f"User: {user_phone_number}")
-            print(f"Next Node ID: {next_node_id}")
-            print(f"Next Node Type: {next_node_data.get('type')}")
-            print(f"{'='*80}\n")
-            
-            # STEP 4.5: Auto-chain logic for transactional nodes (messages)
-            # Continue processing nodes until we reach one that requires user input
-            processed_node_type = next_node_data.get("type")
-            
-            if processed_node_type == "message":
-                print(f"DEBUG: Processed node IS a message, checking chaining...")
-                
-                # Check what the next node is
-                chain_result = await self.detect_and_chain_nodes(
-                    flow=flow,
-                    current_processed_node_id=next_node_id,
-                    current_processed_node_data=next_node_data,
-                    edges=edges
-                )
-                
-                print(f"DEBUG: Chain result: {chain_result}")
-                
-                # If next node is also a message, chain recursively
-                if chain_result.get("should_chain"):
-                    chained_node_id = chain_result.get("next_node_id")
-                    
-                    print(f"DEBUG: Should chain to next message: {chained_node_id}")
-                    
-                    self.log_util.info(
-                        service_name="WhatsAppUserStateService",
-                        message=f"Auto-chaining from message {next_node_id} to message {chained_node_id}"
-                    )
-                    
-                    # Get updated user data
-                    updated_user = await self.flow_db.get_user_data(
-                        user_phone_number=user_phone_number,
-                        brand_id=brand_id
-                    )
-                    
-                    # Recursively process next message node
-                    return await self.find_next_node_details(
-                        flow=flow,
-                        source_node_id=chained_node_id,
-                        message_type=message_type,
-                        message_body=message_body,
-                        user_phone_number=user_phone_number,
-                        brand_id=brand_id,
-                        user_id=user_id,
-                        existing_user=updated_user
-                    )
-                
-                # If next node requires user input (question/button/list), process it and stop
-                elif chain_result.get("reason") == "next_node_requires_user_input":
-                    print(f"DEBUG: Next node requires user input, processing it now...")
-                    
-                    next_edge_after_message = None
-                    for edge in edges:
-                        if edge.source_node_id == next_node_id:
-                            next_edge_after_message = edge
-                            break
-                    
-                    print(f"DEBUG: Found edge after message: {next_edge_after_message is not None}")
-                    
-                    if next_edge_after_message:
-                        final_node_id = next_edge_after_message.target_node_id
-                        final_node_data = None
-                        
-                        for node in flow.flowNodes:
-                            node_dict = _node_to_dict(node)
-                            if node_dict.get("id") == final_node_id:
-                                final_node_data = node_dict
-                                break
-                        
-                        print(f"DEBUG: Final node data found: {final_node_data is not None}")
-                        print(f"DEBUG: Final node type: {final_node_data.get('type') if final_node_data else 'None'}")
-                        
-                        if final_node_data:
-                            print(f"DEBUG: Processing final node {final_node_id}...")
-                            
-                            self.log_util.info(
-                                service_name="UserStateService",
-                                message=f"Processing user-input node {final_node_id} after message {next_node_id}, stopping chain"
-                            )
-                            
-                            # Process the node that requires user input via API
-                            final_node_result = await self._call_node_process_api(
-                                flow=flow,
-                                current_node_id=next_node_id,
-                                next_node_id=final_node_id,
-                                next_node_data=final_node_data,
-                                user_identifier=user_phone_number,
-                                brand_id=brand_id,
-                                user_id=user_id,
-                                channel="whatsapp",  # TODO: Get channel from context
-                                fallback_message=None,
-                                user_state=updated_user_state
-                            )
-                            
-                            print(f"DEBUG: Final node result: {final_node_result}")
-                            
-                            if final_node_result["status"] == "success":
-                                print(f"DEBUG: Final node processed successfully, updating state...")
-                                
-                                # Update user state to the node requiring input
-                                final_user_state = await self.update_user_automation_state_after_message(
-                                    user_phone_number=user_phone_number,
-                                    brand_id=brand_id,
-                                    flow_id=flow.id,
-                                    next_node_id=final_node_id
-                                )
-                                
-                                print(f"DEBUG: Chain complete! User state updated to {final_node_id}")
-                                
-                                return {
-                                    "status": "success",
-                                    "message": "Chain complete, waiting for user input",
-                                    "user_state": final_user_state,
-                                    "next_node_id": final_node_id,
-                                    "processed_node_type": final_node_data.get("type")
-                                }
-            
-            # STEP 5: Check if automation is still active and if there's a next node
-            if updated_user_state and updated_user_state.get("is_in_automation"):
-                # Check if there's a next node available in the flow
-                has_next_node = False
-                
-                # For question nodes (button/list), check if they have expected answers
-                # The edges are from answer IDs, not the node ID itself
-                if next_node_data.get("type") in ("button_question", "list_question"):
-                    expected_answers = next_node_data.get("expectedAnswers", [])
-                    if expected_answers and len(expected_answers) > 0:
-                        # Question nodes with answers are waiting for user response
-                        has_next_node = True
-                else:
-                    # For other node types, check edges directly from the node
-                    for edge in edges:
-                        if edge.source_node_id == next_node_id:
-                            has_next_node = True
-                            break
-
-                # If no next node, exit automation
-                if not has_next_node:
-                    self.log_util.info(
-                        service_name="WhatsAppUserStateService",
-                        message=f"No next node found after {next_node_id}, exiting automation for user {user_phone_number}"
-                    )
-                    # Set is_in_automation to False
-                    await self.flow_db.update_user_automation_state(
-                        user_identifier=user_phone_number,
-                        brand_id=brand_id,
-                        is_in_automation=False
-                    )
-                    
-                    # Get updated user state
-                    updated_user = await self.flow_db.get_user_data(
-                        user_phone_number=user_phone_number,
-                        brand_id=brand_id
-                    )
-                    
-                    return {
-                        "status": "success",
-                        "message": "Flow completed, automation exited",
-                        "user_state": updated_user.model_dump() if updated_user else None,
-                        "next_node_id": next_node_id,
-                        "processed_node_type": next_node_data.get("type"),
-                        "flow_completed": True
-                    }
-            
+            # Return parameters for node identification service
             return {
-                "status": "success",
-                "message": "Node processed successfully",
-                "user_state": updated_user_state,
-                "next_node_id": next_node_id,
-                "processed_node_type": next_node_data.get("type")
+                "handled": False,
+                "is_validation_error": is_validation_error,
+                "fallback_message": fallback_message,
+                "node_id_to_process": node_id_to_process,
+                "current_node_id_for_service": current_node_id_for_service,
+                "validation_result": validation_result
             }
             
         except Exception as e:
             self.log_util.error(
-                service_name="WhatsAppUserStateService",
-                message=f"Error in find_next_node_details: {str(e)}"
+                service_name="UserStateService",
+                message=f"Error in _process_validation_and_get_node_service_params: {str(e)}"
+            )
+            import traceback
+            self.log_util.error(
+                service_name="UserStateService",
+                message=f"Traceback: {traceback.format_exc()}"
+            )
+            # Return error state
+            return {
+                "handled": False,
+                "is_validation_error": False,
+                "fallback_message": None,
+                "node_id_to_process": None,
+                "current_node_id_for_service": existing_user.current_node_id,
+                "validation_result": None,
+                "error": str(e)
+            }
+    
+    async def _update_delay_node_state(
+        self,
+        sender: str,
+        brand_id: int,
+        flow_id: str,
+        channel: str,
+        channel_account_id: Optional[str],
+        next_node_id: Optional[str] = None,
+        next_node_data: Optional[Dict[str, Any]] = None,
+        validation_result: Optional[Dict[str, Any]] = None,
+        fallback_message: Optional[str] = None,
+        clear_delay_data: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Update user state with delay node data or clear delay node data.
+        This function handles delay node processing separately.
+        
+        Args:
+            sender: User identifier
+            brand_id: Brand ID
+            flow_id: Flow ID
+            channel: Channel name
+            channel_account_id: Channel account ID
+            next_node_id: Delay node ID (required when saving, optional when clearing)
+            next_node_data: Complete delay node data (required when saving, ignored when clearing)
+            validation_result: Optional validation result (for validation state updates)
+            fallback_message: Optional fallback message (for validation state updates)
+            clear_delay_data: If True, clears delay_node_data instead of saving it
+        
+        Returns:
+            Dict with status="success" and delay node information (or cleared status)
+        """
+        try:
+            if clear_delay_data:
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"Clearing delay node data for user {sender}"
+                )
+            else:
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"Updating delay node state for node {next_node_id}"
+                )
+            
+            # Convert delay node data to dict for storage (only if not clearing)
+            delay_node_dict = None
+            if not clear_delay_data and next_node_data:
+                def _node_to_dict(node: Any) -> Dict[str, Any]:
+                    if hasattr(node, "model_dump"):
+                        return node.model_dump()
+                    if isinstance(node, dict):
+                        return node
+                    return dict(node)
+                
+                delay_node_dict = _node_to_dict(next_node_data)
+            
+            # Update validation state if needed (for validation scenarios)
+            if validation_result:
+                if validation_result.get("status") == "mismatch_retry":
+                    await self.flow_db.update_validation_state(
+                        user_identifier=sender,
+                        brand_id=brand_id,
+                        validation_failed=True,
+                        failure_message=fallback_message,
+                        channel=channel,
+                        channel_account_id=channel_account_id
+                    )
+                else:
+                    await self.flow_db.update_validation_state(
+                        user_identifier=sender,
+                        brand_id=brand_id,
+                        validation_failed=False,
+                        failure_message=None,
+                        channel=channel,
+                        channel_account_id=channel_account_id
+                    )
+            
+            # Update user automation state with complete delay node object or clear it
+            # When clearing delay data, check if user is still in automation (may have exited if terminal node)
+            # Get current user state to preserve is_in_automation if it was set to False
+            current_user = await self.flow_db.get_user_data(
+                user_identifier=sender,
+                brand_id=brand_id,
+                channel=channel,
+                channel_account_id=channel_account_id
+            )
+            
+            # If clearing delay data and user is not in automation, preserve that state
+            # Otherwise, use the appropriate state (True when saving delay, preserve existing when clearing)
+            is_in_automation_value = True
+            if clear_delay_data and current_user and not current_user.is_in_automation:
+                # User already exited automation (e.g., terminal node), preserve that state
+                is_in_automation_value = False
+                flow_id = None  # Also clear flow_id if exiting automation
+                next_node_id = None  # Also clear current_node_id if exiting automation
+            
+            await self.flow_db.update_user_automation_state(
+                user_identifier=sender,
+                brand_id=brand_id,
+                is_in_automation=is_in_automation_value,
+                current_flow_id=flow_id if not clear_delay_data or is_in_automation_value else None,
+                current_node_id=next_node_id if not clear_delay_data else None,  # Update to delay node ID when saving
+                channel=channel,
+                channel_account_id=channel_account_id,
+                delay_node_data=None if clear_delay_data else delay_node_dict
+            )
+            
+            # Save delay record to database for background scheduler (only when saving delay, not clearing)
+            if not clear_delay_data and delay_node_dict:
+                from models.delay_data import DelayData
+                from datetime import timedelta
+                
+                delay_duration = delay_node_dict.get("delayDuration", 0)
+                delay_unit = delay_node_dict.get("delayUnit", "minutes")
+                wait_time_seconds = delay_node_dict.get("wait_time_seconds", 0)
+                
+                # Calculate wait_time_seconds if not provided
+                if wait_time_seconds == 0:
+                    if delay_unit == "seconds":
+                        wait_time_seconds = delay_duration
+                    elif delay_unit == "minutes":
+                        wait_time_seconds = delay_duration * 60
+                    elif delay_unit == "hours":
+                        wait_time_seconds = delay_duration * 3600
+                    elif delay_unit == "days":
+                        wait_time_seconds = delay_duration * 86400
+                
+                delay_started_at = datetime.utcnow()
+                delay_completes_at = delay_started_at + timedelta(seconds=wait_time_seconds)
+                
+                # Get delay_node_id from delay_node_dict
+                delay_node_id = delay_node_dict.get("id") if delay_node_dict else next_node_id
+                if not delay_node_id:
+                    self.log_util.error(
+                        service_name="UserStateService",
+                        message=f"Cannot save delay record: delay_node_id is missing"
+                    )
+                else:
+                    delay_record = DelayData(
+                        user_identifier=sender,
+                        brand_id=brand_id,
+                        flow_id=flow_id,
+                        delay_node_id=delay_node_id,
+                        delay_node_data=delay_node_dict,
+                        delay_duration=delay_duration,
+                        delay_unit=delay_unit,
+                        wait_time_seconds=wait_time_seconds,
+                        delay_started_at=delay_started_at,
+                        delay_completes_at=delay_completes_at,
+                        channel=channel,
+                        channel_account_id=channel_account_id
+                    )
+                    
+                    saved_delay = await self.flow_db.save_delay(delay_record)
+                    if saved_delay:
+                        self.log_util.info(
+                            service_name="UserStateService",
+                            message=f"Delay record saved with ID: {saved_delay.id}, completes at: {delay_completes_at}"
+                        )
+                    else:
+                        self.log_util.warning(
+                            service_name="UserStateService",
+                            message=f"Failed to save delay record for node {delay_node_id}"
+                        )
+            
+            if clear_delay_data:
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"Successfully cleared delay node data for user {sender}"
+                )
+                return {
+                    "status": "success",
+                    "message": "Delay node data cleared successfully"
+                }
+            else:
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"Successfully updated delay node state for node {next_node_id}"
+                )
+                return {
+                    "status": "success",
+                    "message": "Delay node state updated successfully",
+                    "delay_node_id": next_node_id,
+                    "delay_node_data": delay_node_dict
+                }
+            
+        except Exception as e:
+            self.log_util.error(
+                service_name="UserStateService",
+                message=f"Error updating delay node state: {str(e)}"
+            )
+            import traceback
+            self.log_util.error(
+                service_name="UserStateService",
+                message=f"Traceback: {traceback.format_exc()}"
             )
             return {
                 "status": "error",
-                "message": str(e),
-                "user_state": None
-            }
-
-    async def detect_and_chain_nodes(
+                    "message": f"Error updating delay node state: {str(e)}"
+                }
+    
+    async def _handle_delay_interrupt(
         self,
-        flow: FlowData,
-        current_processed_node_id: str,
-        current_processed_node_data: Dict[str, Any],
-        edges: List[Any]
+        metadata: "WebhookMetadata",
+        data: Dict[str, Any],
+        existing_user: "UserData",
+        sender: str,
+        brand_id: int,
+        channel: str,
+        channel_account_id: Optional[str]
     ) -> Dict[str, Any]:
         """
-        Detect if the currently processed node should automatically chain to the next node.
-        This handles transactional nodes (like message nodes) that don't require user input.
+        Handle user reply when user is in delay state.
+        Checks delayInterrupt flag and processes interrupted/not interrupted paths accordingly.
         
         Args:
-            flow: Complete flow object
-            current_processed_node_id: The node that was just processed
-            current_processed_node_data: The complete node JSON that was just processed
-            edges: List of flow edges
-            
+            metadata: WebhookMetadata
+            data: Webhook data
+            existing_user: UserData with delay_node_data
+            sender: User identifier
+            brand_id: Brand ID
+            channel: Channel name
+            channel_account_id: Channel account ID
+        
         Returns:
-            Dict with keys:
-                - should_chain: bool - whether to chain to next node
-                - next_node_id: str - next node to process (if should_chain=True)
-                - next_node_data: dict - next node JSON (if should_chain=True)
-                - reason: str - reason for decision
+            Dict with status and processing result
         """
         try:
-            # Get the type of node that was just processed
-            processed_node_type = current_processed_node_data.get("type")
-            
-            # Only message nodes should auto-chain
-            if processed_node_type != "message":
+            delay_node_data = existing_user.delay_node_data
+            if not delay_node_data:
+                self.log_util.error(
+                    service_name="UserStateService",
+                    message=f"[DELAY_INTERRUPT] User {sender} has no delay_node_data"
+                )
                 return {
-                    "should_chain": False,
-                    "reason": "node_not_message_type"
+                    "status": "error",
+                    "message": "No delay node data found"
                 }
             
-            # Find the next edge from the current processed node
-            next_edge = None
-            for edge in edges:
-                if edge.source_node_id == current_processed_node_id:
-                    next_edge = edge
-                    break
+            # Check delayInterrupt flag
+            delay_interrupt = delay_node_data.get("delayInterrupt", False)
             
-            # If no next edge, stop chaining
-            if not next_edge:
+            self.log_util.info(
+                service_name="UserStateService",
+                message=f"[DELAY_INTERRUPT] User {sender} sent message during delay. delayInterrupt={delay_interrupt}"
+            )
+            
+            # Get delayResult array
+            delay_result = delay_node_data.get("delayResult", [])
+            if not delay_result or not isinstance(delay_result, list):
+                self.log_util.error(
+                    service_name="UserStateService",
+                    message=f"[DELAY_INTERRUPT] delayResult is missing or invalid in delay_node_data"
+                )
                 return {
-                    "should_chain": False,
-                    "reason": "no_next_edge"
+                    "status": "error",
+                    "message": "Invalid delayResult in delay_node_data"
                 }
             
-            # Get the next node data
+            # Extract delay result IDs (the id field, not nodeResultId)
+            # These IDs are used as source_node_id in edges (e.g., "delay-node-xxx__interrupted" or "delay-node-xxx__not_interrupted")
+            interrupted_node_id = None
+            not_interrupted_node_id = None
+            for item in delay_result:
+                if isinstance(item, dict):
+                    item_id = item.get("id", "")
+                    if "__interrupted" in item_id:
+                        interrupted_node_id = item_id  # Use the delay result ID itself, not nodeResultId
+                    elif "__not_interrupted" in item_id:
+                        not_interrupted_node_id = item_id  # Use the delay result ID itself, not nodeResultId
+            
+            # Handle based on delayInterrupt flag
+            if delay_interrupt:
+                # Interrupt enabled - process interrupted path
+                if not interrupted_node_id:
+                    self.log_util.error(
+                        service_name="UserStateService",
+                        message=f"[DELAY_INTERRUPT] delayInterrupt=true but interruptedNodeId is missing"
+                    )
+                    return {
+                        "status": "error",
+                        "message": "interruptedNodeId not found in delayResult"
+                    }
+                
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"[DELAY_INTERRUPT] Delay interrupted by user message, processing interruptedNodeId: {interrupted_node_id}"
+                )
+                
+                # Cancel delay record in database
+                # Find delay record by user_identifier, flow_id, and delay_node_id
+                delay_node_id = delay_node_data.get("id")
+                if delay_node_id:
+                    # Get all pending delays for this user
+                    from models.delay_data import DelayData
+                    client_data = self.flow_db._get_client_for_current_loop()
+                    try:
+                        from bson import ObjectId
+                        # Find delay record
+                        delay_record = await client_data['collections']['delays'].find_one({
+                            "user_identifier": sender,
+                            "brand_id": brand_id,
+                            "flow_id": existing_user.current_flow_id,
+                            "delay_node_id": delay_node_id,
+                            "processed": False
+                        })
+                        
+                        if delay_record:
+                            # Mark as processed (cancelled)
+                            await client_data['collections']['delays'].update_one(
+                                {"_id": delay_record["_id"]},
+                                {
+                                    "$set": {
+                                        "processed": True,
+                                        "updated_at": datetime.utcnow()
+                                    }
+                                }
+                            )
+                            self.log_util.info(
+                                service_name="UserStateService",
+                                message=f"[DELAY_INTERRUPT] Cancelled delay record {delay_record['_id']}"
+                            )
+                    except Exception as e:
+                        self.log_util.warning(
+                            service_name="UserStateService",
+                            message=f"[DELAY_INTERRUPT] Error cancelling delay record: {str(e)}"
+                        )
+                
+                # Process interrupted path
+                node_service_response = await self.node_identification_service.identify_and_process_node(
+                    metadata=metadata,
+                    data=data,
+                    is_validation_error=False,
+                    fallback_message=None,
+                    node_id_to_process=None,
+                    current_node_id=interrupted_node_id,
+                    flow_id=existing_user.current_flow_id,
+                    user_detail=existing_user.user_detail.model_dump() if existing_user.user_detail else None,
+                    lead_id=existing_user.lead_id if existing_user else None
+                )
+                
+                if node_service_response.get("status") == "success":
+                    next_node_id = node_service_response.get("next_node_id")
+                    if next_node_id:
+                        # Handle successful node processing
+                        processed_value = node_service_response.get("processed_value")
+                        await self._handle_successful_node_processing(
+                            metadata=metadata,
+                            data=data,
+                            next_node_id=next_node_id,
+                            flow_id=existing_user.current_flow_id,
+                            sender=sender,
+                            brand_id=brand_id,
+                            channel=channel,
+                            channel_account_id=channel_account_id,
+                            validation_result=None,
+                            fallback_message=None,
+                            processed_value=processed_value
+                        )
+                        
+                        # Clear delay_node_data after processing interrupted path
+                        await self._update_delay_node_state(
+                            sender=sender,
+                            brand_id=brand_id,
+                            flow_id=existing_user.current_flow_id,
+                            channel=channel,
+                            channel_account_id=channel_account_id,
+                            clear_delay_data=True
+                        )
+                        
+                        self.log_util.info(
+                            service_name="UserStateService",
+                            message=f"[DELAY_INTERRUPT] Successfully processed interrupted path, cleared delay_node_data"
+                        )
+                        
+                        return {
+                            "status": "success",
+                            "message": "Delay interrupted and processed successfully",
+                            "node_id": next_node_id
+                        }
+                    else:
+                        return {
+                            "status": "error",
+                            "message": "Node service returned success but no next_node_id"
+                        }
+                else:
+                    return {
+                        "status": "error",
+                        "message": f"Node service failed: {node_service_response.get('message')}"
+                    }
+            
+            else:
+                # Interrupt disabled - skip processing webhook data, delay continues
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"[DELAY_INTERRUPT] delayInterrupt=false, skipping webhook processing. Delay will continue until completion."
+                )
+                
+                return {
+                    "status": "ignored",
+                    "message": "User message ignored - delay continues (delayInterrupt=false)"
+                }
+        
+        except Exception as e:
+            self.log_util.error(
+                service_name="UserStateService",
+                message=f"[DELAY_INTERRUPT] Error handling delay interrupt: {str(e)}"
+            )
+            import traceback
+            self.log_util.error(
+                service_name="UserStateService",
+                message=f"[DELAY_INTERRUPT] Traceback: {traceback.format_exc()}"
+            )
+            return {
+                "status": "error",
+                "message": f"Error handling delay interrupt: {str(e)}"
+            }
+    
+    async def _handle_successful_node_processing(
+        self,
+        metadata: "WebhookMetadata",
+        data: Dict[str, Any],
+        next_node_id: str,
+        flow_id: str,
+        sender: str,
+        brand_id: int,
+        channel: str,
+        channel_account_id: Optional[str],
+        validation_result: Optional[Dict[str, Any]] = None,
+        fallback_message: Optional[str] = None,
+        processed_value: Optional[Any] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Handle successful node processing when is_validation_error = False.
+        
+        Logic:
+        1. Check if processed node is user input type or delay type
+           - If yes: Update user state DB
+        2. If not user input or delay:
+           - Check if processed node is terminal node (no outgoing edges)
+           - If terminal: Update user state with is_in_automation = False
+           - If not terminal: Recursively call node identification service with processed node as current_node_id
+        
+        Args:
+            metadata: WebhookMetadata
+            data: Webhook data
+            next_node_id: Processed node ID
+            flow_id: Flow ID
+            sender: User identifier
+            brand_id: Brand ID
+            channel: Channel name
+            channel_account_id: Channel account ID
+            validation_result: Optional validation result (for validation state updates)
+            fallback_message: Optional fallback message (for validation state updates)
+        """
+        try:
+            # Get flow to check node type and edges
+            flow = await self.flow_db.get_flow_by_id(flow_id)
+            if not flow:
+                self.log_util.error(
+                    service_name="UserStateService",
+                    message=f"Flow {flow_id} not found for node processing"
+                )
+                return
+            
+            # Get next node data
             def _node_to_dict(node: Any) -> Dict[str, Any]:
                 if hasattr(node, "model_dump"):
                     return node.model_dump()
@@ -999,9 +756,7 @@ class UserStateService:
                     return node
                 return dict(node)
             
-            next_node_id = next_edge.target_node_id
             next_node_data = None
-            
             for node in flow.flowNodes:
                 node_dict = _node_to_dict(node)
                 if node_dict.get("id") == next_node_id:
@@ -1009,438 +764,907 @@ class UserStateService:
                     break
             
             if not next_node_data:
-                return {
-                    "should_chain": False,
-                    "reason": "next_node_not_found"
-                }
+                self.log_util.error(
+                    service_name="UserStateService",
+                    message=f"Next node {next_node_id} not found in flow"
+                )
+                return
             
-            # Get next node type
+            # Get node type
             next_node_type = next_node_data.get("type")
             
-            # If next node requires user input, stop chaining
-            if next_node_type in ("button_question", "list_question", "question"):
-                return {
-                    "should_chain": False,
-                    "reason": "next_node_requires_user_input"
-                }
-            
-            # If next node is a message, chain to it
-            if next_node_type == "message":
-                return {
-                    "should_chain": True,
-                    "next_node_id": next_node_id,
-                    "next_node_data": next_node_data,
-                    "reason": "next_node_is_message"
-                }
-            
-            # Unknown node type - stop chaining
-            return {
-                "should_chain": False,
-                "reason": "unknown_next_node_type"
-            }
-            
-        except Exception as e:
-            self.log_util.error(
-                service_name="WhatsAppUserStateService",
-                message=f"Error in detect_and_chain_nodes: {str(e)}"
-            )
-            return {
-                "should_chain": False,
-                "reason": "error",
-                "error": str(e)
-            }
-
-    async def _handle_reply_mismatch_internal(
-        self,
-        flow: FlowData,
-        current_node: Dict[str, Any],
-        message_type: str,
-        message_body: Dict[str, Any],
-        user_phone_number: str,
-        brand_id: int,
-        user_id: int,
-        existing_user: UserData,
-        edges: List[Any]
-    ) -> Dict[str, Any]:
-        """
-        Internal handler for reply mismatch. Returns status and instructions.
-        """
-        try:
-            # Extract user input
-            user_input = self._extract_user_input(message_type, message_body)
-            if not user_input:
-                return {
-                    "status": "error",
-                    "message": "Could not extract user input"
-                }
-            
-            def _node_to_dict(node: Any) -> Dict[str, Any]:
-                if hasattr(node, "model_dump"):
-                    return node.model_dump()
-                if isinstance(node, dict):
-                    return node
-                return dict(node)
-            
-            # Check if reply matches any button/list node in the flow
-            matched_node_id = None
-            matched_answer_id = None
-            
-            for node in flow.flowNodes:
-                node_dict = _node_to_dict(node)
-                check_node_type = node_dict.get("type")
+            # Check if node is condition or delay (processed by internal node service)
+            if next_node_type == "condition" and processed_value:
+                # Condition node - use processed_value (yes/no node ID) as current_node_id for next call
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"Condition node processed, using processed_value {processed_value} as next node"
+                )
                 
-                if check_node_type in ("button_question", "list_question"):
-                    expected_answers = node_dict.get("expectedAnswers", [])
-                    for answer in expected_answers:
-                        expected_input = answer.get("expectedInput", "")
-                        if expected_input and expected_input.lower() == user_input.lower():
-                            matched_node_id = node_dict.get("id")
-                            matched_answer_id = answer.get("id")
-                            break
-                    if matched_node_id:
-                        break
+                # Call node identification service with processed_value as current_node_id
+                # Note: user_detail not available in this recursive call context
+                node_service_response = await self.node_identification_service.identify_and_process_node(
+                    metadata=metadata,
+                    data=data,
+                    is_validation_error=False,
+                    fallback_message=None,
+                    node_id_to_process=None,
+                    current_node_id=processed_value,  # Use yes/no node ID from condition
+                    flow_id=flow_id,
+                    user_detail=None,  # Not available in recursive condition node processing
+                    lead_id=None  # Not available in recursive condition node processing
+                )
+                
+                if node_service_response.get("status") == "success":
+                    next_next_node_id = node_service_response.get("next_node_id")
+                    if next_next_node_id:
+                        # Recursively handle successful node processing
+                        next_processed_value = node_service_response.get("processed_value")
+                        recursive_result = await self._handle_successful_node_processing(
+                            metadata=metadata,
+                            data=data,
+                            next_node_id=next_next_node_id,
+                            flow_id=flow_id,
+                            sender=sender,
+                            brand_id=brand_id,
+                            channel=channel,
+                            channel_account_id=channel_account_id,
+                            validation_result=validation_result,
+                            fallback_message=fallback_message,
+                            processed_value=next_processed_value
+                        )
+                        # Return recursive result (may be delay node response)
+                        return recursive_result
+                return None
             
-            # If match found in another node, process that node's next edge
-            if matched_node_id and matched_answer_id:
-                next_node_id = None
+            # Check if node is delay type
+            if next_node_type == "delay" and processed_value:
+                # Delay node - use separate function to update delay node state
+                delay_update_result = await self._update_delay_node_state(
+                    sender=sender,
+                            brand_id=brand_id,
+                    flow_id=flow_id,
+                            channel=channel,
+                    channel_account_id=channel_account_id,
+                    next_node_id=next_node_id,
+                    next_node_data=next_node_data,
+                    validation_result=validation_result,
+                    fallback_message=fallback_message,
+                    clear_delay_data=False
+                )
+                
+                # Return success response (will be sent back to webhook service)
+                return delay_update_result
+            
+            # Check if node is user input type or delay type
+            node_detail = await self.flow_db.get_node_detail_by_id(next_node_type)
+            is_user_input = False
+            is_delay = False
+            
+            if node_detail:
+                is_user_input = node_detail.user_input_required
+                is_delay = (next_node_type == "delay")
+            else:
+                # Fallback check
+                is_user_input = next_node_type in ("button_question", "list_question", "question", "trigger_template")
+                is_delay = (next_node_type == "delay")
+            
+            if is_user_input or is_delay:
+                # Update user state DB
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"Processed node {next_node_id} is user input or delay type, updating user state"
+                )
+                
+                # Update validation state if needed (for validation scenarios)
+                if validation_result:
+                    if validation_result.get("status") == "mismatch_retry":
+                        await self.flow_db.update_validation_state(
+                            user_identifier=sender,
+                            brand_id=brand_id,
+                            validation_failed=True,
+                            failure_message=fallback_message,
+                            channel=channel,
+                            channel_account_id=channel_account_id
+                        )
+                    else:
+                        await self.flow_db.update_validation_state(
+                            user_identifier=sender,
+                            brand_id=brand_id,
+                            validation_failed=False,
+                            failure_message=None,
+                            channel=channel,
+                            channel_account_id=channel_account_id
+                        )
+                
+                # Update user automation state
+                await self.flow_db.update_user_automation_state(
+                    user_identifier=sender,
+                    brand_id=brand_id,
+                    is_in_automation=True,
+                    current_flow_id=flow_id,
+                    current_node_id=next_node_id,
+                    channel=channel,
+                    channel_account_id=channel_account_id
+                )
+                
+                # Return success response
+                return {
+                    "status": "success",
+                    "message": f"User state updated for node {next_node_id}",
+                    "node_id": next_node_id
+                }
+            else:
+                # Not user input or delay - check if terminal node
+                edges = await self.flow_db.get_flow_edges(flow_id)
+                is_terminal = True
+                
+                # Check if node has outgoing edges
+                # Edges are objects with source_node_id and target_node_id attributes
                 for edge in edges:
-                    if edge.source_node_id == matched_answer_id:
-                        next_node_id = edge.target_node_id
+                    # Edge objects have source_node_id as an attribute, not in a dict
+                    source_node_id = edge.source_node_id if hasattr(edge, 'source_node_id') else None
+                    if source_node_id == next_node_id:
+                        is_terminal = False
                         break
 
-                if next_node_id:
-                    next_node_data = None
-                    for node in flow.flowNodes:
-                        node_dict = _node_to_dict(node)
-                        if node_dict.get("id") == next_node_id:
-                            next_node_data = node_dict
-                            break
-
-                if next_node_data:
+                if is_terminal:
+                    # Terminal node - exit automation
                     self.log_util.info(
                         service_name="UserStateService",
-                        message=f"User input '{user_input}' matched node {matched_node_id}, processing next node {next_node_id}"
-                    )
-                    node_result = await self._call_node_process_api(
-                        flow=flow,
-                        current_node_id=matched_node_id,
-                        next_node_id=next_node_id,
-                        next_node_data=next_node_data,
-                        user_identifier=user_phone_number,
-                        brand_id=brand_id,
-                        user_id=user_id,
-                        channel="whatsapp",  # TODO: Get channel from context
-                        fallback_message=None,
-                        user_state=existing_user.model_dump() if existing_user else None
+                        message=f"Processed node {next_node_id} is terminal node, exiting automation"
                     )
                     
-                    # Update user state after successful node processing
-                    if node_result["status"] == "success":
-                        updated_user_state = await self.update_user_automation_state_after_message(
-                            user_phone_number=user_phone_number,
-                            brand_id=brand_id,
-                            flow_id=flow.id,
-                            next_node_id=next_node_id
-                        )
-                        
-                        return {
-                            "status": "handled",
-                            "message": "Matched in another node",
-                            "user_state": updated_user_state
-                        }
-                    else:
-                        return {
-                            "status": "error",
-                            "message": node_result["message"]
-                        }
-            
-            # No match found anywhere in flow - return retry status
-            # The node processor will handle validation count and send appropriate message
-            return {
-                "status": "retry",
-                "fallback_message": None,  # Let node processor handle the message
-                "message": "Reply did not match, retrying current node"
-            }
-                
+                    await self.flow_db.update_user_automation_state(
+                        user_identifier=sender,
+                        brand_id=brand_id,
+                        is_in_automation=False,
+                        current_flow_id=None,
+                        current_node_id=None,
+                        channel=channel,
+                        channel_account_id=channel_account_id
+                    )
+                else:
+                    # Not terminal - recursively call node identification service
+                    self.log_util.info(
+                        service_name="UserStateService",
+                        message=f"Processed node {next_node_id} is not terminal, processing next node"
+                    )
+                    
+                    # Note: user_detail not available in this recursive call context
+                    node_service_response = await self.node_identification_service.identify_and_process_node(
+                        metadata=metadata,
+                        data=data,
+                        is_validation_error=False,
+                        fallback_message=None,
+                        node_id_to_process=None,
+                        current_node_id=next_node_id,  # Use processed node as current node
+                        flow_id=flow_id,
+                        user_detail=None,  # Not available in recursive processing
+                        lead_id=None  # Not available in recursive processing
+                    )
+                    
+                    # Handle the response recursively
+                    if node_service_response.get("status") == "success":
+                        next_next_node_id = node_service_response.get("next_node_id")
+                        if next_next_node_id:
+                            # Recursively handle successful node processing
+                            processed_value = node_service_response.get("processed_value")
+                            try:
+                                recursive_result = await self._handle_successful_node_processing(
+                                    metadata=metadata,
+                                    data=data,
+                                    next_node_id=next_next_node_id,
+                                    flow_id=flow_id,
+                                    sender=sender,
+                                    brand_id=brand_id,
+                                    channel=channel,
+                                    channel_account_id=channel_account_id,
+                                    validation_result=None,
+                                    fallback_message=None,
+                                    processed_value=processed_value
+                                )
+                                # Return recursive result (may be delay node response)
+                                return recursive_result
+                            except Exception as e:
+                                self.log_util.error(
+                                    service_name="UserStateService",
+                                    message=f"Error handling successful node processing: {str(e)}"
+                                )
+                                return {
+                                    "status": "error",
+                                    "message": f"Error handling successful node processing: {str(e)}"
+                                }
         except Exception as e:
             self.log_util.error(
-                service_name="WhatsAppUserStateService",
-                message=f"Error handling reply mismatch: {str(e)}"
+                service_name="UserStateService",
+                message=f"Error in _handle_successful_node_processing: {str(e)}"
+            )
+            import traceback
+            self.log_util.error(
+                service_name="UserStateService",
+                message=f"Traceback: {traceback.format_exc()}"
             )
             return {
                 "status": "error",
-                "message": str(e)
+                "message": f"Error in _handle_successful_node_processing: {str(e)}"
             }
-
-    async def check_and_process_user_with_flow(
+    
+    def _get_status_for_webhook(
         self,
+        status: str,
+        message: str,
+        flow_id: Optional[str] = None,
+        trigger_node_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Create status response to send back to WebhookService.
+        Handles all scenarios: triggered, no_trigger, in_automation, etc.
+        
+        Args:
+            status: Status type ("triggered", "no_trigger", "in_automation", "error", etc.)
+            message: Status message
+            flow_id: Flow ID if applicable
+            trigger_node_id: Trigger node ID if applicable
+        
+        Returns:
+            Dict with status information for WebhookService
+        """
+        if status == "no_trigger":
+            return {
+                "status": "no_trigger",
+                "message": "No trigger matched",
+                "flow_id": None,
+                "trigger_node_id": None
+            }
+        # TODO: Add other status cases as needed
+        return {
+            "status": status,
+            "message": message,
+            "flow_id": flow_id,
+            "trigger_node_id": trigger_node_id
+        }
+    
+    async def _check_triggers_and_initiate_flow(
+        self,
+        metadata: "WebhookMetadata",
+        data: Dict[str, Any],
         sender: str,
         brand_id: int,
         user_id: int,
-        waba_id: str,
-        phone_number_id: str,
-        message_type: str,
-        message_body: Dict[str, Any],
-        channel: str = "whatsapp",
-    ) -> None:
+        channel: str,
+        channel_account_id: Optional[str],
+        existing_user: Optional["UserData"] = None
+    ) -> Dict[str, Any]:
         """
-        Check/create user and process flow automation based on user state
-        1. If user doesn't exist: create user → check triggers → if match, initiate flow
-        2. If user exists: check current_node_id → find next node from edges → process next node
+        Common function to check triggers and initiate flow for users not in automation.
+        Used for both new users and existing users not in automation.
+        
+        Args:
+            metadata: Webhook metadata
+            data: Webhook data
+            sender: User identifier
+            brand_id: Brand ID
+            user_id: User ID
+            channel: Channel name
+            channel_account_id: Channel account ID
+            existing_user: Existing user data (None for new users)
+        
+        Returns:
+            Dict with status information for WebhookService
+        """
+        if not self.trigger_identification_service:
+            self.log_util.warning(
+                service_name="UserStateService",
+                message=f"⚠️ TriggerIdentificationService is not initialized, cannot check triggers"
+            )
+            return self._get_status_for_webhook(
+                status="error",
+                message="TriggerIdentificationService not initialized"
+            )
+        
+        # Use existing_user's channel_account_id if available, otherwise use provided one
+        final_channel_account_id = channel_account_id
+        if existing_user and existing_user.channel_account_id:
+            final_channel_account_id = existing_user.channel_account_id
+        
+        trigger_result = await self.trigger_identification_service.identify_and_initiate_trigger_flow(
+            metadata=metadata,
+            data=data,
+            channel_account_id=final_channel_account_id,
+            existing_user=existing_user
+        )
+        
+        # If trigger matched, call node service first
+        if trigger_result.get("status") == "triggered":
+            flow_id = trigger_result.get("flow_id")
+            trigger_node_id = trigger_result.get("trigger_node_id")
+            
+            if flow_id and trigger_node_id:
+                user_type = "EXISTING_USER" if existing_user else "NEW_USER"
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"[{user_type}] Trigger matched! Calling node service with trigger_node_id: {trigger_node_id}"
+                )
+                
+                # Step 1: Call node service first (don't update user state yet)
+                # - node_id_to_process = null (node service identifies next node from trigger node)
+                # - current_node_id = trigger_node_id
+                user_detail_dict = None
+                if existing_user and existing_user.user_detail:
+                    user_detail_dict = existing_user.user_detail.model_dump()
+                
+                # Get lead_id from existing_user if available
+                lead_id_for_trigger = existing_user.lead_id if existing_user and hasattr(existing_user, 'lead_id') else None
+                
+                node_service_response = await self.node_identification_service.identify_and_process_node(
+                    metadata=metadata,
+                    data=data,
+                    is_validation_error=False,
+                    fallback_message=None,
+                    node_id_to_process=None,
+                    current_node_id=trigger_node_id,
+                    flow_id=flow_id,
+                    user_detail=user_detail_dict,
+                    lead_id=lead_id_for_trigger
+                )
+
+                # Step 2: Check node service response
+                if node_service_response.get("status") == "success":
+                    next_node_id = node_service_response.get("next_node_id")
+                    if next_node_id:
+                        self.log_util.info(
+                            service_name="UserStateService",
+                            message=f"[{user_type}] Node service processed successfully, next_node_id: {next_node_id}"
+                        )
+                        
+                        # Step 3: Handle successful node processing (is_validation_error = False)
+                        processed_value = node_service_response.get("processed_value")
+                        await self._handle_successful_node_processing(
+                            metadata=metadata,
+                            data=data,
+                            next_node_id=next_node_id,
+                            flow_id=flow_id,
+                            sender=sender,
+                            brand_id=brand_id,
+                            channel=channel,
+                            channel_account_id=final_channel_account_id,
+                            validation_result=None,
+                            fallback_message=None,
+                            processed_value=processed_value
+                        )
+                        
+                        # Step 4: Return status to WebhookService
+                        return self._get_status_for_webhook(
+                            status="triggered",
+                            message="Trigger matched and flow initiated",
+                            flow_id=flow_id,
+                            trigger_node_id=trigger_node_id
+                        )
+                else:
+                    # Node service failed
+                    self.log_util.error(
+                        service_name="UserStateService",
+                        message=f"[{user_type}] Node service failed: {node_service_response.get('message')}"
+                    )
+                    return self._get_status_for_webhook(
+                        status="error",
+                        message=f"Node processing failed: {node_service_response.get('message')}",
+                        flow_id=flow_id,
+                        trigger_node_id=trigger_node_id
+                    )
+            else:
+                # No trigger matched
+                return self._get_status_for_webhook(
+                    status="no_trigger",
+                    message="No trigger matched"
+                )
+            
+    async def check_and_process_user_with_flow(
+        self,
+        metadata: "WebhookMetadata",
+        data: Dict[str, Any],
+        channel_account_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Check/create user and process flow automation based on user state.
+        
+        Flow:
+        1. If user doesn't exist: create user → check triggers → if match, call node service with trigger_node_id
+        2. If user exists and in automation:
+           - Check if delay_complete webhook → call node service with current_node_id (delay node)
+           - Otherwise: check if current node has expected reply → call validation service → call node service
+        3. If user exists but not in automation: check triggers → if match, call node service
+        
+        Args:
+            metadata: WebhookMetadata from saved webhook
+            data: Normalized data from saved webhook
+            channel_account_id: Channel account ID
         """
         try:
+            sender = metadata.sender
+            brand_id = metadata.brand_id
+            user_id = metadata.user_id
+            channel = metadata.channel
+            message_type = metadata.message_type
+            
+            # For delay_complete webhooks, extract user_identifier from data if sender is "system"
+            # This handles cases where delay webhook was created with sender="system"
+            if message_type == "delay_complete":
+                user_state_id = data.get("user_state_id")
+                if user_state_id:
+                    # Use user_state_id from data instead of sender
+                    sender = user_state_id
+                    self.log_util.info(
+                        service_name="UserStateService",
+                        message=f"[DELAY_COMPLETE] Using user_state_id from data: {user_state_id}"
+                    )
+            
             existing_user = await self.flow_db.get_user_data(
                 user_identifier=sender,
-                brand_id=brand_id
+                brand_id=brand_id,
+                channel=channel,
+                channel_account_id=channel_account_id
             )
 
             if existing_user is None:
+                # ========== SCENARIO 1: NEW USER (NOT IN AUTOMATION) ==========
+                self.log_util.info(
+                    service_name="UserStateService",
+                    message=f"[NEW_USER] Creating new user: {sender}, brand_id: {brand_id}"
+                )
+                
+                # Step 1: Create user_detail based on channel
+                user_detail = UserDetail()
+                user_detail.set_identifier(channel, sender)
+                
+                # Step 2: Get or create lead in lead management service
+                # Extract phone and email from user_detail
+                phone = user_detail.phone_number
+                email = user_detail.email
+                
+                # Extract additional user info from data if available
+                first_name = data.get("first_name") or data.get("firstName")
+                last_name = data.get("last_name") or data.get("lastName")
+                address = data.get("address")
+                
+                # Get or create lead
+                lead_id = await self.lead_management_service.get_or_create_lead(
+                    phone=phone,
+                    email=email,
+                    first_name=first_name,
+                    last_name=last_name,
+                    address=address,
+                    brand_id=brand_id,
+                    user_id=user_id
+                )
+                
+                if not lead_id:
+                    self.log_util.warning(
+                        service_name="UserStateService",
+                        message=f"Failed to get/create lead for user: {sender}, brand_id: {brand_id}. Continuing without lead_id."
+                    )
+                else:
+                    self.log_util.info(
+                        service_name="UserStateService",
+                        message=f"Got lead_id: {lead_id} for user: {sender}"
+                    )
+                
+                # Step 3: Create user in user state with lead_id
                 new_user = UserData(
-                    user_phone_number=sender,
+                    user_detail=user_detail,
                     brand_id=brand_id,
                     user_id=user_id,
+                    lead_id=lead_id,
                     channel=channel,
-                    channel_identifier=waba_id,
-                    phone_number_id=phone_number_id
+                    channel_account_id=channel_account_id
                 )
                 saved_user = await self.flow_db.save_user_data(new_user)
                 if not saved_user:
                     self.log_util.error(
-                        service_name="WhatsAppUserStateService",
-                        message=f"Failed to create user record for phone number: {sender}, brand_id: {brand_id}"
+                        service_name="UserStateService",
+                        message=f"Failed to create user record for user: {sender}, brand_id: {brand_id}"
                     )
-                    return
+                    return self._get_status_for_webhook(
+                        status="error",
+                        message=f"Failed to create user record for user: {sender}"
+                    )
+                
                 self.log_util.info(
-                    service_name="WhatsAppUserStateService",
-                    message=f"Created new user record for phone number: {sender}, brand_id: {brand_id}"
+                    service_name="UserStateService",
+                    message=f"Created new user record for user: {sender}, brand_id: {brand_id}, lead_id: {lead_id}"
                 )
-
-                if self.flow_service:
-                    self.log_util.info(
-                        service_name="WhatsAppUserStateService",
-                        message=f"[TRIGGER_FLOW] Checking triggers for new user {sender}, brand_id: {brand_id}, message_type: {message_type}"
-                    )
-                    trigger_result = await self.flow_service.check_and_get_flow_for_trigger(
-                        brand_id=brand_id,
-                        message_type=message_type,
-                        message_body=message_body
-                    )
-
-                    if trigger_result:
-                        flow_id, trigger_node_id = trigger_result
-                        self.log_util.info(
-                            service_name="WhatsAppUserStateService",
-                            message=f"[TRIGGER_FLOW] ✅ Trigger matched! flow_id: {flow_id}, trigger_node_id: {trigger_node_id}"
-                        )
-                        flow = await self.flow_db.get_flow_by_id(flow_id)
-                        if flow:
-                            self.log_util.info(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[TRIGGER_FLOW] ✅ Flow retrieved successfully: {flow.name} (id: {flow_id})"
-                            )
-                            # Get the newly created user to pass as existing_user
-                            new_user_data = await self.flow_db.get_user_data(
-                                user_identifier=sender,
-                                brand_id=brand_id
-                            )
-                            self.log_util.info(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[TRIGGER_FLOW] ✅ User data retrieved for {sender}"
-                            )
-                            
-                            # Find the edge from trigger node to get the first processable node
-                            # Trigger nodes are not processable - we need to find the next node via edge
-                            self.log_util.info(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[TRIGGER_FLOW] Looking for edge from trigger node {trigger_node_id} to first processable node"
-                            )
-                            edges = await self.flow_db.get_flow_edges(flow_id)
-                            self.log_util.info(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[TRIGGER_FLOW] Retrieved {len(edges)} edges for flow {flow_id}"
-                            )
-                            first_processable_node_id = None
-                            
-                            for edge in edges:
-                                self.log_util.info(
-                                    service_name="WhatsAppUserStateService",
-                                    message=f"[TRIGGER_FLOW] Checking edge: source={edge.source_node_id}, target={edge.target_node_id}"
-                                )
-                                if edge.source_node_id == trigger_node_id:
-                                    first_processable_node_id = edge.target_node_id
-                                    self.log_util.info(
-                                        service_name="WhatsAppUserStateService",
-                                        message=f"[TRIGGER_FLOW] ✅ Found first processable node {first_processable_node_id} from trigger node {trigger_node_id}"
-                                    )
-                                    break
-                            
-                            if not first_processable_node_id:
-                                self.log_util.error(
-                                    service_name="WhatsAppUserStateService",
-                                    message=f"[TRIGGER_FLOW] ❌ No edge found from trigger node {trigger_node_id} to first processable node. Available edges: {[(e.source_node_id, e.target_node_id) for e in edges]}"
-                                )
-                                return
-                            
-                            # Call find_next_node_details orchestrator with the first processable node (not the trigger node)
-                            self.log_util.info(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[TRIGGER_FLOW] Calling find_next_node_details with source_node_id: {first_processable_node_id}"
-                            )
-                            result = await self.find_next_node_details(
-                                flow=flow,
-                                source_node_id=first_processable_node_id,
-                                message_type=message_type,
-                                message_body=message_body,
-                                    user_phone_number=sender,
-                                    brand_id=brand_id,
-                                    user_id=user_id,
-                                existing_user=new_user_data
-                            )
-                            
-                            self.log_util.info(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[TRIGGER_FLOW] find_next_node_details returned: status={result.get('status')}, message={result.get('message')}, next_node_id={result.get('next_node_id')}"
-                            )
-                            
-                            # Log result
-                            if result["status"] == "success":
-                                self.log_util.info(
-                                    service_name="WhatsAppUserStateService",
-                                    message=f"[TRIGGER_FLOW] ✅ Successfully initiated flow for new user {sender}. Next node: {result.get('next_node_id')}"
-                                )
-                            elif result["status"] == "handled":
-                                self.log_util.info(
-                                    service_name="WhatsAppUserStateService",
-                                    message=f"[TRIGGER_FLOW] ✅ Handled special case for new user {sender}: {result.get('message')}"
-                                )
-                            else:
-                                self.log_util.error(
-                                    service_name="WhatsAppUserStateService",
-                                    message=f"[TRIGGER_FLOW] ❌ Error initiating flow for new user {sender}: status={result.get('status')}, message={result.get('message')}"
-                                )
-                        else:
-                            self.log_util.error(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[TRIGGER_FLOW] ❌ Failed to retrieve flow with id: {flow_id}"
-                            )
-                    else:
-                        self.log_util.info(
-                            service_name="WhatsAppUserStateService",
-                            message=f"[TRIGGER_FLOW] ❌ No trigger matched for user {sender}, brand_id: {brand_id}, message_type: {message_type}"
-                        )
-                else:
-                    self.log_util.warning(
-                        service_name="WhatsAppUserStateService",
-                        message=f"[TRIGGER_FLOW] ⚠️ FlowService is not initialized, cannot check triggers"
-                    )
+                
+                # Check for triggers and initiate flow if matched (new user, not in automation)
+                # Pass saved_user (which contains lead_id) as existing_user for trigger flow
+                return await self._check_triggers_and_initiate_flow(
+                    metadata=metadata,
+                    data=data,
+                    sender=sender,
+                    brand_id=brand_id,
+                    user_id=user_id,
+                    channel=channel,
+                    channel_account_id=channel_account_id,
+                    existing_user=saved_user  # Pass saved_user which contains lead_id
+                )
             else:
-                # Existing user - check if in automation
+                # ========== SCENARIO 2: EXISTING USER ==========
                 self.log_util.info(
-                    service_name="WhatsAppUserStateService",
+                    service_name="UserStateService",
                     message=f"[EXISTING_USER] Processing existing user {sender}, is_in_automation: {existing_user.is_in_automation}, current_flow_id: {existing_user.current_flow_id}, current_node_id: {existing_user.current_node_id}"
                 )
+                
+                # Handle delay_complete webhooks - check if user has delay_node_data
+                if message_type == "delay_complete":
+                    if not existing_user.delay_node_data:
+                        self.log_util.warning(
+                            service_name="UserStateService",
+                            message=f"[EXISTING_USER] Delay complete webhook received but user {sender} has no delay_node_data. User may have exited automation or delay was already processed. Skipping."
+                        )
+                        return
+                    
+                    # User must be in automation for delay_complete to be valid
+                    if not existing_user.is_in_automation or not existing_user.current_flow_id:
+                        self.log_util.warning(
+                            service_name="UserStateService",
+                            message=f"[EXISTING_USER] Delay complete webhook received but user {sender} is not in automation or has no current_flow_id. Skipping."
+                        )
+                        return
+                
                 if (
                     existing_user.is_in_automation
                     and existing_user.current_flow_id
-                    and existing_user.current_node_id
+                    and (existing_user.current_node_id or message_type == "delay_complete")  # Allow delay_complete even if current_node_id is None
                 ):
+                    # ========== USER IN AUTOMATION ==========
                     self.log_util.info(
-                        service_name="WhatsAppUserStateService",
-                        message=f"[EXISTING_USER] User is in automation, retrieving flow {existing_user.current_flow_id}"
+                        service_name="UserStateService",
+                        message=f"[EXISTING_USER] User is in automation, flow_id: {existing_user.current_flow_id}, current_node_id: {existing_user.current_node_id}"
                     )
-                    flow = await self.flow_db.get_flow_by_id(existing_user.current_flow_id)
-                    if flow:
+                    
+                    # Check if user is in delay state and has delay_node_data
+                    if existing_user.delay_node_data and message_type != "delay_complete":
+                        # User is in delay state and sent a message - check for interrupt
+                        return await self._handle_delay_interrupt(
+                            metadata=metadata,
+                            data=data,
+                            existing_user=existing_user,
+                            sender=sender,
+                            brand_id=brand_id,
+                            channel=channel,
+                            channel_account_id=channel_account_id
+                    )
+                    
+                    # Check if delay_complete webhook
+                    if message_type == "delay_complete":
+                        # ========== DELAY COMPLETE WEBHOOK ==========
                         self.log_util.info(
-                            service_name="WhatsAppUserStateService",
-                            message=f"[EXISTING_USER] ✅ Flow retrieved: {flow.name}, calling find_next_node_details with source_node_id: {existing_user.current_node_id}"
-                        )
-                        # STEP 1: Call find_next_node_details orchestrator
-                        result = await self.find_next_node_details(
-                            flow=flow,
-                            source_node_id=existing_user.current_node_id,
-                            message_type=message_type,
-                            message_body=message_body,
-                                user_phone_number=sender,
-                                brand_id=brand_id,
-                                user_id=user_id,
-                            existing_user=existing_user
-                        )
-                        self.log_util.info(
-                            service_name="WhatsAppUserStateService",
-                            message=f"[EXISTING_USER] find_next_node_details returned: status={result.get('status')}, message={result.get('message')}, next_node_id={result.get('next_node_id')}"
+                            service_name="UserStateService",
+                            message=f"[EXISTING_USER] Delay complete webhook received, processing next node"
                         )
                         
-                        # STEP 5: Update user state in DB based on result
-                        if result["status"] == "success":
-                            self.log_util.info(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[EXISTING_USER] ✅ Successfully processed node for user {sender}. Next node: {result.get('next_node_id')}"
+                        # Validate delay node exists in user state
+                        if not existing_user.delay_node_data:
+                            self.log_util.warning(
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] Cannot process delay_complete webhook: delay_node_data is missing in user state. User may have exited automation or delay was already processed."
                             )
-                            # User state already updated by find_next_node_details
-                        elif result["status"] == "handled":
-                            self.log_util.info(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[EXISTING_USER] ✅ Handled special case for user {sender}: {result.get('message')}"
-                            )
-                            # User state already updated (e.g., validation limit exceeded)
-                        else:
+                            return
+                        
+                        # Get delay node ID from webhook data to validate it matches user state
+                        delay_node_id_from_webhook = data.get("node_id") or (data.get("user_state_id") and None)  # Will be in original_message_body
+                        # Note: delay_node_id is in original_message_body, not in normalized data
+                        # We'll validate by checking if delay_node_data exists and has the expected structure
+                        
+                        delay_result = existing_user.delay_node_data.get("delayResult")
+                        if not delay_result or not isinstance(delay_result, list):
                             self.log_util.error(
-                                service_name="WhatsAppUserStateService",
-                                message=f"[EXISTING_USER] ❌ Error processing node for user {sender}: status={result.get('status')}, message={result.get('message')}"
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] Cannot process delay_complete webhook: delayResult is missing or invalid in delay_node_data"
                             )
-                    else:
-                        self.log_util.error(
-                            service_name="WhatsAppUserStateService",
-                            message=f"[EXISTING_USER] ❌ Failed to retrieve flow with id: {existing_user.current_flow_id}"
+                            return
+                        
+                        # Extract notInterruptedNodeId from array format
+                        # Should use delay result ID (e.g., "delay-node-xxx__not_interrupted") not nodeResultId
+                        current_node_id_for_delay = None
+                        for item in delay_result:
+                            if isinstance(item, dict):
+                                item_id = item.get("id", "")
+                                if "__not_interrupted" in item_id:
+                                    # Use the delay result ID itself (e.g., "delay-node-xxx__not_interrupted")
+                                    # This is used as source_node_id in edges
+                                    current_node_id_for_delay = item_id
+                                    break
+                        
+                        if not current_node_id_for_delay:
+                            self.log_util.error(
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] Cannot process delay_complete webhook: __not_interrupted result ID is missing in delayResult"
+                            )
+                            return
+                        
+                        self.log_util.info(
+                            service_name="UserStateService",
+                            message=f"[EXISTING_USER] Extracted notInterruptedNodeId from delay_node_data: {current_node_id_for_delay}"
                         )
-                else:
-                    # User exists but not in automation - check for triggers
-                    self.log_util.info(
-                        service_name="WhatsAppUserStateService",
-                        message=f"[EXISTING_USER] User exists but not in automation, checking for triggers"
-                    )
-                    if self.flow_service:
-                        trigger_result = await self.flow_service.check_and_get_flow_for_trigger(
-                            brand_id=brand_id,
-                            message_type=message_type,
-                            message_body=message_body
+                        
+                        # Step 1: Call node service with:
+                        # - node_id_to_process = null (node service identifies next node from delay node)
+                        # - current_node_id = notInterruptedNodeId from delay_node_data
+                        node_service_response = await self.node_identification_service.identify_and_process_node(
+                            metadata=metadata,
+                            data=data,
+                            is_validation_error=False,
+                            fallback_message=None,
+                            node_id_to_process=None,
+                            current_node_id=current_node_id_for_delay,
+                            flow_id=existing_user.current_flow_id,
+                            user_detail=None,
+                            lead_id=existing_user.lead_id if existing_user and hasattr(existing_user, 'lead_id') else None
                         )
-
-                        if trigger_result:
-                            flow_id, trigger_node_id = trigger_result
-                            flow = await self.flow_db.get_flow_by_id(flow_id)
-                            if flow:
-                                # Call find_next_node_details orchestrator (same as in-automation flow)
-                                result = await self.find_next_node_details(
-                                    flow=flow,
-                                    source_node_id=trigger_node_id,
-                                    message_type=message_type,
-                                    message_body=message_body,
-                                        user_phone_number=sender,
-                                        brand_id=brand_id,
-                                        user_id=user_id,
-                                    existing_user=existing_user
+                        
+                        # Step 2: Update user state based on node service response
+                        if node_service_response.get("status") == "success":
+                            next_node_id = node_service_response.get("next_node_id")
+                            if next_node_id:
+                                # Handle successful node processing (is_validation_error = False)
+                                processed_value = node_service_response.get("processed_value")
+                                await self._handle_successful_node_processing(
+                                    metadata=metadata,
+                                    data=data,
+                                    next_node_id=next_node_id,
+                                    flow_id=existing_user.current_flow_id,
+                                    sender=sender,
+                                    brand_id=brand_id,
+                                    channel=channel,
+                                    channel_account_id=existing_user.channel_account_id,
+                                    validation_result=None,
+                                    fallback_message=None,
+                                    processed_value=processed_value
                                 )
                                 
-                                # Log result
-                                if result["status"] == "success":
-                                    self.log_util.info(
-                                        service_name="WhatsAppUserStateService",
-                                        message=f"Successfully initiated flow for user {sender}. Next node: {result.get('next_node_id')}"
+                                # Step 3: Clear delay_node_data after successful next node processing
+                                await self._update_delay_node_state(
+                                    sender=sender,
+                                    brand_id=brand_id,
+                                    flow_id=existing_user.current_flow_id,
+                                    channel=channel,
+                                    channel_account_id=existing_user.channel_account_id,
+                                    clear_delay_data=True
+                                )
+                                
+                                # Mark delay record as processed in database
+                                # Find delay record by user_identifier, flow_id, and delay_node_id
+                                from models.delay_data import DelayData
+                                # Note: We'll mark it as processed when delay_complete webhook is sent
+                                # This is handled by the delay scheduler service
+                                
+                                self.log_util.info(
+                                    service_name="UserStateService",
+                                    message=f"[EXISTING_USER] Delay complete processed successfully, cleared delay_node_data, next_node_id: {next_node_id}"
+                                )
+                        else:
+                            self.log_util.error(
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] Node service failed for delay webhook: {node_service_response.get('message')}"
+                            )
+                    else:
+                        # ========== REGULAR REPLY - CHECK VALIDATION ==========
+                        # Extract user reply from data
+                        user_reply = data.get("user_reply")
+                        
+                        if not user_reply:
+                            self.log_util.warning(
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] Could not extract user reply from data"
+                            )
+                            return
+                        
+                        # Get flow to check if current node has expected reply
+                        flow = await self.flow_db.get_flow_by_id(existing_user.current_flow_id)
+                        if not flow:
+                            self.log_util.error(
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] ❌ Failed to retrieve flow with id: {existing_user.current_flow_id}"
+                            )
+                            return
+                        
+                        # Check if current node has expected reply using node_details database
+                        def _node_to_dict(node: Any) -> Dict[str, Any]:
+                            if hasattr(node, "model_dump"):
+                                return node.model_dump()
+                            if isinstance(node, dict):
+                                return node
+                            return dict(node)
+                        
+                        current_node = None
+                        for node in flow.flowNodes:
+                            node_dict = _node_to_dict(node)
+                            if node_dict.get("id") == existing_user.current_node_id:
+                                current_node = node_dict
+                                break
+                        
+                        if not current_node:
+                            self.log_util.error(
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] ❌ Current node {existing_user.current_node_id} not found in flow"
+                            )
+                            return
+                        
+                        # Get node type from current node
+                        node_type = current_node.get("type")
+                        
+                        # Get node detail from database to check if it requires user input
+                        node_detail = await self.flow_db.get_node_detail_by_id(node_type)
+                        has_expected_reply = False
+                        is_text = False
+                        
+                        if node_detail:
+                            has_expected_reply = node_detail.user_input_required
+                            # Check if node type is "question" (text question)
+                            is_text = (node_type == "question")
+                        else:
+                            # Fallback: if node_detail not found, check node type directly
+                            self.log_util.warning(
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] Node detail not found for node_type: {node_type}, using fallback check"
+                            )
+                            has_expected_reply = node_type in ("button_question", "list_question", "trigger_template")
+                            is_text = (node_type == "question")
+                        
+                        if has_expected_reply:
+                            # ========== CURRENT NODE HAS EXPECTED REPLY - CALL VALIDATION SERVICE ==========
+                            validation_params = await self._process_validation_and_get_node_service_params(
+                                metadata=metadata,
+                                data=data,
+                                existing_user=existing_user,
+                                flow=flow,
+                                current_node=current_node,
+                                node_type=node_type,
+                                is_text=is_text,
+                                sender=sender,
+                                        brand_id=brand_id,
+                                        channel=channel,
+                                        channel_account_id=existing_user.channel_account_id
                                     )
-                                elif result["status"] == "handled":
-                                    self.log_util.info(
-                                        service_name="WhatsAppUserStateService",
-                                        message=f"Handled special case for user {sender}: {result.get('message')}"
+                            
+                            # Check if validation_exit was handled (automation exited)
+                            if validation_params.get("handled"):
+                                # Validation limit exceeded, automation already exited
+                                    return
+                            
+                            # Extract parameters for node identification service
+                            is_validation_error = validation_params.get("is_validation_error", False)
+                            fallback_message = validation_params.get("fallback_message")
+                            node_id_to_process = validation_params.get("node_id_to_process")
+                            current_node_id_for_service = validation_params.get("current_node_id_for_service")
+                            validation_result = validation_params.get("validation_result")
+                            
+                            if not current_node_id_for_service:
+                                self.log_util.error(
+                                    service_name="UserStateService",
+                                    message=f"[EXISTING_USER] Cannot proceed: current_node_id_for_service is None/empty"
                                     )
-                                else:
-                                    self.log_util.error(
-                                        service_name="WhatsAppUserStateService",
-                                        message=f"Error initiating flow for user {sender}: {result.get('message')}"
+                                return
+                            
+                            self.log_util.info(
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] Calling NodeIdentificationService with: current_node_id={current_node_id_for_service}, node_id_to_process={node_id_to_process}, is_validation_error={is_validation_error}"
+                            )
+                            
+                            user_detail_dict = existing_user.user_detail.model_dump() if existing_user.user_detail else None
+                            node_service_response = await self.node_identification_service.identify_and_process_node(
+                                metadata=metadata,
+                                data=data,
+                                is_validation_error=is_validation_error,
+                                fallback_message=fallback_message,
+                                node_id_to_process=node_id_to_process,
+                                current_node_id=current_node_id_for_service,
+                                flow_id=flow.id,
+                                user_detail=user_detail_dict,
+                                lead_id=existing_user.lead_id if existing_user and hasattr(existing_user, 'lead_id') else None
+                            )
+                            
+                            # Step 2: Update user state based on node service response (only after successful node processing)
+                            if node_service_response.get("status") == "success":
+                                next_node_id = node_service_response.get("next_node_id")
+                                if next_node_id:
+                                    # Use _handle_successful_node_processing for all cases (it handles both validation_error and normal cases)
+                                    processed_value = node_service_response.get("processed_value")
+                                    node_processing_result = await self._handle_successful_node_processing(
+                                        metadata=metadata,
+                                        data=data,
+                                        next_node_id=next_node_id,
+                                        flow_id=flow.id,
+                                        sender=sender,
+                                        brand_id=brand_id,
+                                        channel=channel,
+                                        channel_account_id=existing_user.channel_account_id,
+                                        validation_result=validation_result,
+                                        fallback_message=fallback_message,
+                                            processed_value=processed_value
                                     )
+                                    
+                                    # If delay node was processed, return the delay response to webhook service
+                                    if node_processing_result and node_processing_result.get("status") == "success" and node_processing_result.get("delay_node_id"):
+                                        return self._get_status_for_webhook(
+                                            status="triggered",
+                                            message=node_processing_result.get("message", "Delay node processed successfully"),
+                                            flow_id=flow.id
+                                        )
+                            else:
+                                self.log_util.error(
+                                    service_name="UserStateService",
+                                    message=f"[EXISTING_USER] Node service failed: {node_service_response.get('message')}"
+                                )
+                        else:
+                            # ========== CURRENT NODE HAS NO EXPECTED REPLY - CALL NODE SERVICE DIRECTLY ==========
+                            self.log_util.info(
+                                service_name="UserStateService",
+                                message=f"[EXISTING_USER] Current node has no expected reply, calling node service directly"
+                            )
+                            
+                            # Step 1: Call node service with:
+                            # - node_id_to_process = null (node service identifies next node via default edge)
+                            # - current_node_id = current node ID
+                            user_detail_dict = existing_user.user_detail.model_dump() if existing_user.user_detail else None
+                            node_service_response = await self.node_identification_service.identify_and_process_node(
+                                metadata=metadata,
+                                data=data,
+                                is_validation_error=False,
+                                fallback_message=None,
+                                node_id_to_process=None,
+                                current_node_id=existing_user.current_node_id,
+                                flow_id=flow.id,
+                                user_detail=user_detail_dict,
+                                lead_id=existing_user.lead_id if existing_user and hasattr(existing_user, 'lead_id') else None
+                            )
+                            
+                            # Step 2: Update user state based on node service response
+                            if node_service_response.get("status") == "success":
+                                next_node_id = node_service_response.get("next_node_id")
+                                if next_node_id:
+                                    # Handle successful node processing (is_validation_error = False)
+                                    processed_value = node_service_response.get("processed_value")
+                                    await self._handle_successful_node_processing(
+                                        metadata=metadata,
+                                        data=data,
+                                        next_node_id=next_node_id,
+                                        flow_id=flow.id,
+                                        sender=sender,
+                                        brand_id=brand_id,
+                                        channel=channel,
+                                        channel_account_id=existing_user.channel_account_id,
+                                        validation_result=None,
+                                        fallback_message=None,
+                                        processed_value=processed_value
+                                    )
+                            else:
+                                self.log_util.error(
+                                    service_name="UserStateService",
+                                    message=f"[EXISTING_USER] Node service failed: {node_service_response.get('message')}"
+                                )
+                else:
+                    # ========== USER EXISTS BUT NOT IN AUTOMATION ==========
+                    self.log_util.info(
+                        service_name="UserStateService",
+                        message=f"[EXISTING_USER] User not in automation, checking triggers"
+                    )
+                    
+                    # Check for triggers and initiate flow if matched (existing user, not in automation)
+                    return await self._check_triggers_and_initiate_flow(
+                        metadata=metadata,
+                        data=data,
+                        sender=sender,
+                        brand_id=brand_id,
+                        user_id=user_id,
+                        channel=channel,
+                        channel_account_id=channel_account_id,
+                        existing_user=existing_user
+                    )
         except Exception as e:
             self.log_util.error(
-                service_name="WhatsAppUserStateService",
+                service_name="UserStateService",
                 message=f"Error in check_and_process_user_with_flow: {str(e)}"
             )
 

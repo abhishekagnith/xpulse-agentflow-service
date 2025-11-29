@@ -9,9 +9,9 @@ class ProcessNodeRequest(BaseModel):
     """
     # Flow information
     flow_id: str
-    current_node_id: str
-    next_node_id: str
-    next_node_data: Dict[str, Any]  # Complete node JSON
+    current_node_id: Optional[str] = None
+    next_node_id: Optional[str] = None
+    next_node_data: Optional[Dict[str, Any]] = None  # Complete node JSON
     
     # User information
     user_identifier: str  # Phone number for WhatsApp, email for Email, etc.
@@ -23,6 +23,7 @@ class ProcessNodeRequest(BaseModel):
     
     # Node processing options
     fallback_message: Optional[str] = None  # Message to send before node
+    is_validation_error: Optional[bool] = False  # True if this is a validation error retry
     user_state: Optional[Dict[str, Any]] = None  # Complete user state from DB
     
     class Config:
@@ -48,11 +49,22 @@ class ProcessNodeRequest(BaseModel):
                 "channel": "whatsapp",
                 "fallback_message": None,
                 "user_state": {
-                    "user_phone_number": "1234567890",
+                    "user_detail": {
+                        "phone_number": "1234567890",
+                        "email": None,
+                        "instagram_user_id": None,
+                        "facebook_user_id": None,
+                        "telegram_user_id": None,
+                        "custom_identifier": None
+                    },
                     "is_in_automation": True,
                     "current_flow_id": "flow_123",
                     "current_node_id": "node_1",
-                    "validation_failure_count": 0
+                    "validation": {
+                        "failed": False,
+                        "failure_count": 0,
+                        "failure_message": None
+                    }
                 }
             }
         }

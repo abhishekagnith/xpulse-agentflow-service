@@ -15,6 +15,8 @@ from services.internal.brand_service import BrandService
 # Models
 from models.flow_data import FlowData
 from models.flow_trigger_data import FlowTriggerData
+from models.response.user.user_data import UserData
+from models.response.brand.brand_info import BrandInfo
 
 # Exceptions
 from exceptions.flow_exception import FlowServiceException
@@ -44,6 +46,8 @@ class FlowService:
                 raise FlowServiceException(message="Brand not found")
             
             # Create FlowData from the request
+            # Note: Channel is saved at node level, not flow level
+            # Status is always set to "draft" for create operations
             flow = FlowData(
                 id=flow_data.get("id"),
                 name=flow_data.get("name"),
@@ -53,26 +57,33 @@ class FlowService:
                 lastUpdated=flow_data.get("lastUpdated"),
                 transform=flow_data.get("transform"),
                 isPro=flow_data.get("isPro", False),
+                status="draft",  # Always set to draft for create operations
                 brand_id=brand_data.id,
                 user_id=user_id,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
             
-            # Save to database
-            saved_flow = await self.flow_db.create_flow(flow)
+            # Save to database - pass original flowNodes to preserve channel field
+            original_flow_nodes = flow_data.get("flowNodes", [])
+            saved_flow = await self.flow_db.create_flow(flow, original_flow_nodes=original_flow_nodes)
             
             # Save flow nodes separately
-            if flow.flowNodes:
-                nodes_list = []
-                for node in flow.flowNodes:
-                    if hasattr(node, 'model_dump'):
-                        nodes_list.append(node.model_dump())
-                    elif isinstance(node, dict):
-                        nodes_list.append(node)
+            # Use original flow_data nodes to preserve channel field (before Pydantic conversion)
+            if flow_data.get("flowNodes"):
+                nodes_list = flow_data.get("flowNodes", [])
+                # Ensure all nodes are dicts
+                processed_nodes = []
+                for node in nodes_list:
+                    if isinstance(node, dict):
+                        processed_nodes.append(node)
+                    elif hasattr(node, 'model_dump'):
+                        # For Pydantic models, use model_dump with exclude_unset=False to preserve extra fields
+                        node_dict = node.model_dump(exclude_unset=False, mode='json')
+                        processed_nodes.append(node_dict)
                     else:
-                        nodes_list.append(dict(node))
-                await self.flow_db.save_flow_nodes(saved_flow.id, nodes_list)
+                        processed_nodes.append(dict(node))
+                await self.flow_db.save_flow_nodes(saved_flow.id, processed_nodes)
             
             # Save flow edges separately
             if flow.flowEdges:
@@ -171,7 +182,9 @@ class FlowService:
     
     async def get_flow_detail(self, flow_id: str) -> FlowData:
         """
-        Get flow detail by MongoDB ID
+        Get flow detail by MongoDB ID with transaction counts for each node.
+        Transaction counts are only included if flow status is "published" or "stop".
+        Draft flows do not include transaction counts.
         """
         try:
             flow = await self.flow_db.get_flow_by_id(flow_id)
@@ -179,7 +192,39 @@ class FlowService:
             if flow is None:
                 raise FlowServiceException(message="Flow not found")
             
-            return flow
+            # Only get transaction counts if flow is published or stopped
+            if flow.status == "published" or flow.status == "stop":
+                # Get transaction counts grouped by node_id for this flow
+                transaction_counts = await self.flow_db.get_transaction_counts_by_node(flow_id)
+                
+                # Add transaction count to each node in the flow
+                updated_nodes = []
+                for node in flow.flowNodes:
+                    # Convert node to dict to add extra field
+                    node_dict = None
+                    if hasattr(node, 'model_dump'):
+                        node_dict = node.model_dump(exclude_unset=False, mode='json')
+                    elif isinstance(node, dict):
+                        node_dict = node.copy()
+                    else:
+                        node_dict = dict(node)
+                    
+                    # Add transaction count for this node_id
+                    node_id = node_dict.get("id")
+                    transaction_count = transaction_counts.get(node_id, 0)
+                    node_dict["transactionCount"] = transaction_count
+                    
+                    updated_nodes.append(node_dict)
+                
+                # Create a new FlowData with updated nodes
+                flow_dict = flow.model_dump(exclude_unset=False, mode='json')
+                flow_dict["flowNodes"] = updated_nodes
+                
+                # Return FlowData with transaction counts
+                return FlowData.model_validate(flow_dict)
+            else:
+                # For draft flows, return flow without transaction counts
+                return flow
             
         except FlowServiceException:
             raise
@@ -219,6 +264,10 @@ class FlowService:
             # - To delete nodes: send flowNodes with only the nodes you want to keep
             # - To keep all nodes: omit flowNodes from the request
             # - To delete all nodes: send flowNodes as an empty array []
+            
+            # Create FlowData from the request
+            # Note: Channel is saved at node level, not flow level
+            # Status is always set to "draft" for update operations
             flow = FlowData(
                 id=flow_id,  # Keep the same ID
                 name=flow_data.get("name", existing_flow.name),
@@ -228,29 +277,36 @@ class FlowService:
                 lastUpdated=flow_data.get("lastUpdated"),
                 transform=flow_data.get("transform", existing_flow.transform),
                 isPro=flow_data.get("isPro", existing_flow.isPro),
+                status="draft",  # Always set to draft for update operations
                 brand_id=brand_data.id,
                 user_id=user_id,
                 created_at=existing_flow.created_at,  # Keep original created_at
                 updated_at=datetime.utcnow()
             )
             
-            # Update in database
-            updated_flow = await self.flow_db.update_flow(flow_id, flow)
+            # Update in database - pass original flowNodes to preserve channel field
+            original_flow_nodes = flow_data.get("flowNodes") if "flowNodes" in flow_data else None
+            updated_flow = await self.flow_db.update_flow(flow_id, flow, original_flow_nodes=original_flow_nodes)
             
             if updated_flow is None:
                 raise FlowServiceException(message="Failed to update flow")
             
             # Update flow nodes separately (if provided in request)
+            # Use original flow_data nodes to preserve channel field (before Pydantic conversion)
             if "flowNodes" in flow_data:
-                nodes_list = []
-                for node in flow.flowNodes:
-                    if hasattr(node, 'model_dump'):
-                        nodes_list.append(node.model_dump())
-                    elif isinstance(node, dict):
-                        nodes_list.append(node)
+                nodes_list = flow_data.get("flowNodes", [])
+                # Ensure all nodes are dicts
+                processed_nodes = []
+                for node in nodes_list:
+                    if isinstance(node, dict):
+                        processed_nodes.append(node)
+                    elif hasattr(node, 'model_dump'):
+                        # For Pydantic models, use model_dump with exclude_unset=False to preserve extra fields
+                        node_dict = node.model_dump(exclude_unset=False, mode='json')
+                        processed_nodes.append(node_dict)
                     else:
-                        nodes_list.append(dict(node))
-                await self.flow_db.save_flow_nodes(flow_id, nodes_list)
+                        processed_nodes.append(dict(node))
+                await self.flow_db.save_flow_nodes(flow_id, processed_nodes)
             
             # Update flow edges separately (if provided in request)
             if "flowEdges" in flow_data:
@@ -317,131 +373,77 @@ class FlowService:
             )
             raise FlowServiceException(message=f"Error updating flow: {str(e)}")
     
-    async def check_and_get_flow_for_trigger(self, brand_id: int, message_type: str, message_body: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    async def update_flow_status(self, user_id: int, flow_id: str, status: str) -> FlowData:
         """
-        Check user message against available triggers and return flow_id and node_id if match found
-        Returns: (flow_id, node_id) tuple if match found, None otherwise
+        Update flow status. Valid statuses: "draft", "published", "stop"
+        
+        Status transition rules:
+        - draft -> published: Allowed
+        - published -> stop: Allowed
+        - stop -> published: Allowed (resume)
+        - Any -> draft: Not allowed (use update API instead)
         """
         try:
-            self.log_util.info(
-                service_name="WhatsAppFlowService",
-                message=f"[TRIGGER_CHECK] Starting trigger check for brand_id: {brand_id}, message_type: {message_type}"
-            )
-            # Extract text content from message body based on message type
-            text_content = None
-            
-            if message_type == "text":
-                # Extract text from text message
-                if message_body.get("type") == "text" and "text" in message_body:
-                    text_content = message_body["text"].get("body", "").strip()
-                    self.log_util.info(
-                        service_name="WhatsAppFlowService",
-                        message=f"[TRIGGER_CHECK] Extracted text content: '{text_content}'"
-                    )
-            
-            elif message_type == "button":
-                # Extract text from button message (button text or payload)
-                if message_body.get("type") == "button" and "button" in message_body:
-                    button_data = message_body["button"]
-                    # Prefer text over payload, but use payload if text is not available
-                    text_content = button_data.get("text", button_data.get("payload", "")).strip()
-                    self.log_util.info(
-                        service_name="WhatsAppFlowService",
-                        message=f"[TRIGGER_CHECK] Extracted button content: '{text_content}'"
-                    )
-            
-            if not text_content:
-                self.log_util.warning(
-                    service_name="WhatsAppFlowService",
-                    message=f"[TRIGGER_CHECK] ❌ No text content extracted from message_body: {message_body}"
+            # Validate status
+            valid_statuses = ["draft", "published", "stop"]
+            if status not in valid_statuses:
+                raise FlowServiceException(
+                    message=f"Invalid status: {status}. Valid statuses are: {', '.join(valid_statuses)}"
                 )
-                return None
             
-            # Get all triggers for this brand
-            self.log_util.info(
-                service_name="WhatsAppFlowService",
-                message=f"[TRIGGER_CHECK] Fetching triggers for brand_id: {brand_id}"
-            )
-            triggers = await self.flow_db.get_flow_triggers_by_brand_id(brand_id)
-            if triggers is None or len(triggers) == 0:
-                self.log_util.warning(
-                    service_name="WhatsAppFlowService",
-                    message=f"[TRIGGER_CHECK] ❌ No triggers found for brand_id: {brand_id}"
+            # Get user info
+            user_data: Optional[UserData] = await self.user_service.get_user_info(user_id)
+            if user_data is None:
+                raise FlowServiceException(message="User not found")
+            
+            # Get brand info
+            brand_data: Optional[BrandInfo] = await self.brand_service.get_brand_info(user_data.brand_id)
+            if brand_data is None:
+                raise FlowServiceException(message="Brand not found")
+            
+            # Check if flow exists and belongs to the user
+            existing_flow = await self.flow_db.get_flow_by_id(flow_id)
+            if existing_flow is None:
+                raise FlowServiceException(message="Flow not found")
+            
+            # Verify the flow belongs to the user's brand
+            if existing_flow.brand_id != brand_data.id or existing_flow.user_id != user_id:
+                raise FlowServiceException(message="Unauthorized: Flow does not belong to this user")
+            
+            # Validate status transitions
+            current_status = existing_flow.status or "draft"
+            
+            # Don't allow changing to draft via status API (use update API instead)
+            if status == "draft":
+                raise FlowServiceException(
+                    message="Cannot set status to 'draft' using status API. Use update API to modify flow content."
                 )
-                return None
+            
+            # Update the status field
+            updated_flow = await self.flow_db.update_flow_status(flow_id, status)
+            
+            if updated_flow is None:
+                raise FlowServiceException(message=f"Failed to update flow status to {status}")
+            
+            status_action = {
+                "published": "published",
+                "stop": "stopped"
+            }.get(status, status)
             
             self.log_util.info(
                 service_name="WhatsAppFlowService",
-                message=f"[TRIGGER_CHECK] Found {len(triggers)} triggers to check against text: '{text_content}'"
+                message=f"Flow '{updated_flow.name}' {status_action} successfully with ID: {flow_id} (status: {current_status} -> {status})"
             )
             
-            # Check each trigger
-            for trigger in triggers:
-                self.log_util.info(
-                    service_name="WhatsAppFlowService",
-                    message=f"[TRIGGER_CHECK] Checking trigger: type={trigger.trigger_type}, flow_id={trigger.flow_id}, node_id={trigger.node_id}, values={trigger.trigger_values}"
-                )
-                if trigger.trigger_type == "keyword":
-                    # Keyword triggers only work with text messages
-                    if message_type == "text":
-                        # Check if message text contains any keyword (case-insensitive)
-                        for keyword in trigger.trigger_values:
-                            self.log_util.info(
-                                service_name="WhatsAppFlowService",
-                                message=f"[TRIGGER_CHECK] Comparing keyword '{keyword}' (lower: '{keyword.lower()}') with text '{text_content}' (lower: '{text_content.lower()}')"
-                            )
-                            if keyword.lower() in text_content.lower():
-                                self.log_util.info(
-                                    service_name="WhatsAppFlowService",
-                                    message=f"[TRIGGER_CHECK] ✅ Keyword trigger matched: '{keyword}' in message '{text_content}' for flow_id: {trigger.flow_id}, node_id: {trigger.node_id}"
-                                )
-                                return (trigger.flow_id, trigger.node_id)
-                            else:
-                                self.log_util.info(
-                                    service_name="WhatsAppFlowService",
-                                    message=f"[TRIGGER_CHECK] ❌ Keyword '{keyword}' not found in '{text_content}'"
-                                )
-                    else:
-                        self.log_util.info(
-                            service_name="WhatsAppFlowService",
-                            message=f"[TRIGGER_CHECK] Skipping keyword trigger (message_type is '{message_type}', not 'text')"
-                        )
-                
-                elif trigger.trigger_type == "template":
-                    # Template triggers work with both text and button messages
-                    # Check if message text/button exactly matches any expected button text (case-insensitive)
-                    for button_text in trigger.trigger_values:
-                        self.log_util.info(
-                            service_name="WhatsAppFlowService",
-                            message=f"[TRIGGER_CHECK] Comparing template button '{button_text}' (lower: '{button_text.lower()}') with text '{text_content}' (lower: '{text_content.lower()}')"
-                        )
-                        if button_text.lower() == text_content.lower():
-                            self.log_util.info(
-                                service_name="WhatsAppFlowService",
-                                message=f"[TRIGGER_CHECK] ✅ Template trigger matched: '{button_text}' matches message '{text_content}' (type: {message_type}) for flow_id: {trigger.flow_id}, node_id: {trigger.node_id}"
-                            )
-                            return (trigger.flow_id, trigger.node_id)
-                        else:
-                            self.log_util.info(
-                                service_name="WhatsAppFlowService",
-                                message=f"[TRIGGER_CHECK] ❌ Template button '{button_text}' does not match '{text_content}'"
-                            )
+            return updated_flow
             
-            self.log_util.info(
-                service_name="WhatsAppFlowService",
-                message=f"[TRIGGER_CHECK] ❌ No trigger matched for text: '{text_content}'"
-            )
-            return None
-            
+        except FlowServiceException:
+            raise
         except Exception as e:
             self.log_util.error(
                 service_name="WhatsAppFlowService",
-                message=f"[TRIGGER_CHECK] ❌ Error checking triggers: {str(e)}"
+                message=f"Error updating flow status: {str(e)}"
             )
-            import traceback
-            self.log_util.error(
-                service_name="WhatsAppFlowService",
-                message=f"[TRIGGER_CHECK] Traceback: {traceback.format_exc()}"
-            )
-            return None
+            raise FlowServiceException(message=f"Error updating flow status: {str(e)}")
+    
 

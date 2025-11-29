@@ -9,7 +9,7 @@ class FlowUserContext(BaseModel):
     Each record stores one variable-value pair per flow
     """
     id: Optional[str] = Field(default=None, alias="_id")
-    user_phone_number: str
+    user_identifier: str = Field(..., description="User identifier (phone number, email, etc.) based on channel")
     brand_id: int
     flow_id: str
     variable_name: str  # The @variable name (e.g., "@user_name")

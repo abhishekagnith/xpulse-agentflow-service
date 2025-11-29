@@ -20,6 +20,9 @@ from models.flow_trigger_data import FlowTriggerData
 from models.flow_user_context import FlowUserContext
 from models.user_data import UserData
 from models.webhook_message_data import WebhookMessageData
+from models.webhook_adapter_processed_data import WebhookAdapterProcessedData
+from models.node_detail_data import NodeDetailData
+from models.user_detail import UserDetail
 
 """
 Database class for flow operations
@@ -63,6 +66,10 @@ class FlowDB:
         self.users = None
         self.flow_user_context = None
         self.flow_webhook_messages = None
+        self.webhook_adapter_processed = None
+        self.node_details = None
+        self.user_transactions = None
+        self.delays = None
         
         # Thread-safe initialization lock
         self._client_lock = threading.Lock()
@@ -139,7 +146,11 @@ class FlowDB:
             'flow_triggers': db.flow_triggers,
             'users': db.users,
             'flow_user_context': db.flow_user_context,
-            'flow_webhook_messages': db.flow_webhook_messages
+            'flow_webhook_messages': db.flow_webhook_messages,
+            'webhook_adapter_processed': db.webhook_adapter_processed,
+            'node_details': db.node_details,
+            'user_transactions': db.user_transactions,
+            'delays': db.delays
         }
     
     
@@ -169,6 +180,8 @@ class FlowDB:
             self.users = None
             self.flow_user_context = None
             self.flow_webhook_messages = None
+            self.webhook_adapter_processed = None
+            self.node_details = None
             
             self.log_util.info(
                 service_name="FlowDB",
@@ -176,13 +189,24 @@ class FlowDB:
             )
 
     # Flow CRUD operations
-    async def create_flow(self, flow: FlowData) -> Optional[FlowData]:
+    async def create_flow(self, flow: FlowData, original_flow_nodes: Optional[List[Dict[str, Any]]] = None) -> Optional[FlowData]:
         """
         Create a new flow
+        
+        Args:
+            flow: FlowData object (Pydantic model)
+            original_flow_nodes: Optional original flowNodes as dicts (to preserve channel field)
         """
         client_data = self._get_client_for_current_loop()
         try:
             flow_dict = flow.model_dump(exclude={"id"})
+            # Remove channel field if present (channel is saved at node level, not flow level)
+            flow_dict.pop("channel", None)
+            
+            # Replace flowNodes with original nodes to preserve channel field
+            if original_flow_nodes is not None:
+                flow_dict["flowNodes"] = original_flow_nodes
+            
             result = await client_data['collections']['flows'].insert_one(flow_dict)
             flow_dict["id"] = str(result.inserted_id)
             flow_dict["_id"] = result.inserted_id
@@ -248,13 +272,25 @@ class FlowDB:
             self.log_util.error(service_name="FlowDB", message=f"Error getting flows: {str(e)}")
             return []
 
-    async def update_flow(self, flow_id: str, flow: FlowData) -> Optional[FlowData]:
+    async def update_flow(self, flow_id: str, flow: FlowData, original_flow_nodes: Optional[List[Dict[str, Any]]] = None) -> Optional[FlowData]:
         """
         Update a flow
+        
+        Args:
+            flow_id: Flow ID
+            flow: FlowData object (Pydantic model)
+            original_flow_nodes: Optional original flowNodes as dicts (to preserve channel field)
         """
         client_data = self._get_client_for_current_loop()
         try:
             flow_dict = flow.model_dump(exclude={"id"})
+            # Remove channel field if present (channel is saved at node level, not flow level)
+            flow_dict.pop("channel", None)
+            
+            # Replace flowNodes with original nodes to preserve channel field
+            if original_flow_nodes is not None:
+                flow_dict["flowNodes"] = original_flow_nodes
+            
             flow_dict["updated_at"] = datetime.utcnow()
             result = await client_data['collections']['flows'].find_one_and_update(
                 {"_id": ObjectId(flow_id)},
@@ -267,6 +303,34 @@ class FlowDB:
             return FlowData.model_validate(result)
         except Exception as e:
             self.log_util.error(service_name="FlowDB", message=f"Error updating flow: {str(e)}")
+            return None
+
+    async def update_flow_status(self, flow_id: str, status: str) -> Optional[FlowData]:
+        """
+        Update only the status field of a flow
+        
+        Args:
+            flow_id: Flow ID
+            status: New status value (e.g., "draft", "published")
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            result = await client_data['collections']['flows'].find_one_and_update(
+                {"_id": ObjectId(flow_id)},
+                {
+                    "$set": {
+                        "status": status,
+                        "updated_at": datetime.utcnow()
+                    }
+                },
+                return_document=True
+            )
+            if result is None:
+                return None
+            result["id"] = str(result["_id"])
+            return FlowData.model_validate(result)
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error updating flow status: {str(e)}")
             return None
 
     async def save_flow_nodes(self, flow_id: str, nodes: List[Dict[str, Any]]) -> bool:
@@ -283,12 +347,24 @@ class FlowDB:
 
             node_documents = []
             for node in nodes:
+                # Convert node to dict if it's a Pydantic model
+                if hasattr(node, "model_dump"):
+                    node_dict = node.model_dump()
+                elif isinstance(node, dict):
+                    node_dict = node
+                else:
+                    node_dict = dict(node)
+                
+                # Extract channel from node dict
+                channel = node_dict.get("channel")
+                
                 node_document = {
                     "flow_id": flow_id,
-                    "node_id": node.get("id"),
-                    "node_type": node.get("type"),
-                    "flow_node_type": node.get("flowNodeType"),
-                    "node_data": node,
+                    "node_id": node_dict.get("id"),
+                    "node_type": node_dict.get("type"),
+                    "flow_node_type": node_dict.get("flowNodeType"),
+                    "channel": channel,  # Extract channel field separately
+                    "node_data": node_dict,  # Save the full node as dict
                     "created_at": datetime.utcnow(),
                     "updated_at": datetime.utcnow()
                 }
@@ -393,19 +469,22 @@ class FlowDB:
         """
         Get all flow triggers for a brand.
         Since triggers are linked to flows, we need to:
-        1. Get all flows for this brand
+        1. Get all flows for this brand with status="published"
         2. Get all triggers for those flows
         """
         client_data = self._get_client_for_current_loop()
         try:
-            # First, get all flow IDs for this brand
-            flows = await self.get_flows(brand_id=brand_id)
-            if not flows:
+            # First, get all published flow IDs for this brand
+            query: Dict[str, Any] = {"brand_id": brand_id, "status": "published"}
+            cursor = client_data['collections']['flows'].find(query)
+            flow_ids = []
+            async for flow_dict in cursor:
+                flow_ids.append(str(flow_dict["_id"]))
+            
+            if not flow_ids:
                 return []
             
-            flow_ids = [flow.id for flow in flows]
-            
-            # Get all triggers for these flows
+            # Get all triggers for these published flows
             cursor = client_data['collections']['flow_triggers'].find({"flow_id": {"$in": flow_ids}})
             triggers = []
             async for trigger_dict in cursor:
@@ -429,6 +508,40 @@ class FlowDB:
             self.log_util.error(service_name="FlowDB", message=f"Error deleting flow: {str(e)}")
             return False
 
+    def _build_user_query(self, user_identifier: str, brand_id: int, channel: str, channel_account_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Build MongoDB query to find user by identifier based on channel.
+        Also includes channel_account_id to ensure same user with different channel accounts are treated as separate users.
+        Returns a query dict that searches in the appropriate user_detail field.
+        """
+        channel_lower = channel.lower()
+        query = {"brand_id": brand_id}
+        
+        if channel_lower == "whatsapp" or channel_lower == "sms":
+            query["user_detail.phone_number"] = user_identifier
+        elif channel_lower == "gmail" or channel_lower == "email":
+            query["user_detail.email"] = user_identifier
+        elif channel_lower == "instagram":
+            query["user_detail.instagram_user_id"] = user_identifier
+        elif channel_lower == "facebook":
+            query["user_detail.facebook_user_id"] = user_identifier
+        elif channel_lower == "telegram":
+            query["user_detail.telegram_user_id"] = user_identifier
+        else:
+            # For unknown channels, try custom_identifier or search in all fields
+            query["$or"] = [
+                {"user_detail.custom_identifier": user_identifier},
+                {"user_detail.phone_number": user_identifier},
+                {"user_detail.email": user_identifier}
+            ]
+        
+        # Add channel_account_id to query if provided
+        # This ensures same user_detail with different channel_account_id creates separate user states
+        if channel_account_id:
+            query["channel_account_id"] = channel_account_id
+        
+        return query
+
     # User operations
     async def save_user_data(self, user_data: UserData) -> Optional[UserData]:
         """
@@ -448,16 +561,15 @@ class FlowDB:
             self.log_util.error(service_name="FlowDB", message=f"Error saving user data: {str(e)}")
             return None
 
-    async def get_user_data(self, user_identifier: str, brand_id: int) -> Optional[UserData]:
+    async def get_user_data(self, user_identifier: str, brand_id: int, channel: str = "whatsapp", channel_account_id: Optional[str] = None) -> Optional[UserData]:
         """
-        Get user data
+        Get user data by identifier, channel, and channel_account_id.
+        channel_account_id is required to distinguish between same user_detail with different channel accounts.
         """
         client_data = self._get_client_for_current_loop()
         try:
-            result = await client_data['collections']['users'].find_one({
-                "user_phone_number": user_identifier,
-                "brand_id": brand_id
-            })
+            query = self._build_user_query(user_identifier, brand_id, channel, channel_account_id)
+            result = await client_data['collections']['users'].find_one(query)
             if result is None:
                 return None
             result["id"] = str(result["_id"])
@@ -467,7 +579,9 @@ class FlowDB:
             return None
 
     async def update_user_automation_state(self, user_identifier: str, brand_id: int, is_in_automation: bool, 
-                                          current_flow_id: Optional[str] = None, current_node_id: Optional[str] = None) -> Optional[UserData]:
+                                          current_flow_id: Optional[str] = None, current_node_id: Optional[str] = None, 
+                                          channel: str = "whatsapp", channel_account_id: Optional[str] = None,
+                                          delay_node_data: Optional[Dict[str, Any]] = None) -> Optional[UserData]:
         """
         Update user automation state
         """
@@ -475,6 +589,7 @@ class FlowDB:
         try:
             update_dict = {
                 "is_in_automation": is_in_automation,
+                "channel": channel,
                 "updated_at": datetime.utcnow()
             }
             
@@ -482,12 +597,18 @@ class FlowDB:
                 update_dict["current_flow_id"] = current_flow_id
             if current_node_id is not None:
                 update_dict["current_node_id"] = current_node_id
+            if channel_account_id is not None:
+                update_dict["channel_account_id"] = channel_account_id
+            if delay_node_data is not None:
+                # Save delay node data
+                update_dict["delay_node_data"] = delay_node_data
+            elif not is_in_automation:
+                # Clear delay_node_data when exiting automation
+                update_dict["delay_node_data"] = None
             
+            query = self._build_user_query(user_identifier, brand_id, channel, channel_account_id)
             result = await client_data['collections']['users'].find_one_and_update(
-                {
-                    "user_phone_number": user_identifier,
-                    "brand_id": brand_id
-                },
+                query,
                 {"$set": update_dict},
                 return_document=True
             )
@@ -500,46 +621,51 @@ class FlowDB:
             return None
 
     async def update_validation_state(self, user_identifier: str, brand_id: int, validation_failed: bool, 
-                                     failure_message: Optional[str] = None) -> Optional[UserData]:
+                                     failure_message: Optional[str] = None, channel: str = "whatsapp", 
+                                     channel_account_id: Optional[str] = None) -> Optional[UserData]:
         """
         Update user validation state
         """
         client_data = self._get_client_for_current_loop()
         try:
+            # Get current user to access validation state
+            current_user = await self.get_user_data(user_identifier, brand_id, channel, channel_account_id)
+            if not current_user:
+                return None
+            
+            # Import ValidationData here to avoid circular imports
+            from models.validation_data import ValidationData
+            
             if validation_failed:
                 # Increment failure count
-                result = await client_data['collections']['users'].find_one_and_update(
-                    {
-                        "user_phone_number": user_identifier,
-                        "brand_id": brand_id
-                    },
-                    {
-                        "$set": {
-                            "validation_failed": True,
-                            "validation_failure_message": failure_message,
-                            "updated_at": datetime.utcnow()
-                        },
-                        "$inc": {"validation_failure_count": 1}
-                    },
-                    return_document=True
+                new_validation = ValidationData(
+                    failed=True,
+                    failure_count=current_user.validation.failure_count + 1,
+                    failure_message=failure_message
                 )
             else:
                 # Reset on success
-                result = await client_data['collections']['users'].find_one_and_update(
-                    {
-                        "user_phone_number": user_identifier,
-                        "brand_id": brand_id
-                    },
-                    {
-                        "$set": {
-                            "validation_failed": False,
-                            "validation_failure_count": 0,
-                            "validation_failure_message": None,
-                            "updated_at": datetime.utcnow()
-                        }
-                    },
-                    return_document=True
+                new_validation = ValidationData(
+                    failed=False,
+                    failure_count=0,
+                    failure_message=None
                 )
+            
+            # Update validation object
+            query = self._build_user_query(user_identifier, brand_id, channel, channel_account_id)
+            update_dict = {
+                        "validation": new_validation.model_dump(),
+                "channel": channel,
+                        "updated_at": datetime.utcnow()
+                    }
+            if channel_account_id is not None:
+                update_dict["channel_account_id"] = channel_account_id
+            
+            result = await client_data['collections']['users'].find_one_and_update(
+                query,
+                {"$set": update_dict},
+                return_document=True
+            )
             
             if result is None:
                 return None
@@ -557,7 +683,7 @@ class FlowDB:
         client_data = self._get_client_for_current_loop()
         try:
             cursor = client_data['collections']['flow_user_context'].find({
-                "user_phone_number": user_identifier,
+                "user_identifier": user_identifier,
                 "brand_id": brand_id,
                 "flow_id": flow_id
             })
@@ -566,7 +692,9 @@ class FlowDB:
             async for result in cursor:
                 context_dict = dict(result)
                 if "_id" in context_dict:
+                    # Convert ObjectId to string for both id and _id (model uses alias)
                     context_dict["id"] = str(context_dict["_id"])
+                    context_dict["_id"] = str(context_dict["_id"])
                 contexts.append(FlowUserContext(**context_dict))
             
             return contexts
@@ -583,7 +711,7 @@ class FlowDB:
         try:
             result = await client_data['collections']['flow_user_context'].find_one_and_update(
                 {
-                    "user_phone_number": user_identifier,
+                    "user_identifier": user_identifier,
                     "brand_id": brand_id,
                     "flow_id": flow_id,
                     "variable_name": variable_name
@@ -595,7 +723,7 @@ class FlowDB:
                         "updated_at": datetime.utcnow()
                     },
                     "$setOnInsert": {
-                        "user_phone_number": user_identifier,
+                        "user_identifier": user_identifier,
                         "brand_id": brand_id,
                         "flow_id": flow_id,
                         "variable_name": variable_name,
@@ -625,7 +753,7 @@ class FlowDB:
         client_data = self._get_client_for_current_loop()
         try:
             result = await client_data['collections']['flow_user_context'].delete_many({
-                "user_phone_number": user_identifier,
+                "user_identifier": user_identifier,
                 "brand_id": brand_id,
                 "flow_id": flow_id
             })
@@ -672,4 +800,295 @@ class FlowDB:
         except Exception as e:
             self.log_util.error(service_name="FlowDB", message=f"Error updating webhook message: {str(e)}")
             return None
+
+    # Webhook Adapter Processed CRUD operations
+    async def save_webhook_adapter_processed(self, webhook_adapter_data: WebhookAdapterProcessedData) -> Optional[WebhookAdapterProcessedData]:
+        """
+        Save a webhook message after adapter processing (normalization).
+        This stores the normalized webhook data for tracking and debugging.
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            webhook_dict = webhook_adapter_data.model_dump(exclude={"id"})
+            result = await client_data['collections']['webhook_adapter_processed'].insert_one(webhook_dict)
+            if result.inserted_id is None:
+                self.log_util.error(service_name="FlowDB", message="Failed to save webhook adapter processed data")
+                return None
+            webhook_dict["id"] = str(result.inserted_id)
+            webhook_dict["_id"] = result.inserted_id
+            return WebhookAdapterProcessedData.model_validate(webhook_dict)
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error saving webhook adapter processed data: {str(e)}")
+            return None
+
+    # Node Details CRUD operations
+    async def create_node_detail(self, node_detail: NodeDetailData) -> Optional[NodeDetailData]:
+        """
+        Create a new node detail
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            node_dict = node_detail.model_dump(exclude={"id"})
+            result = await client_data['collections']['node_details'].insert_one(node_dict)
+            if result.inserted_id:
+                node_dict["_id"] = result.inserted_id
+                node_dict["id"] = str(result.inserted_id)
+                return NodeDetailData.model_validate(node_dict)
+            return None
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error creating node detail: {str(e)}")
+            return None
+
+    async def get_node_detail_by_id(self, node_id: str) -> Optional[NodeDetailData]:
+        """
+        Get node detail by node_id (e.g., "trigger-keyword", "message", etc.)
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            result = await client_data['collections']['node_details'].find_one({"node_id": node_id})
+            if result is None:
+                return None
+            result["id"] = str(result["_id"])
+            return NodeDetailData.model_validate(result)
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error getting node detail: {str(e)}")
+            return None
+
+    async def get_all_node_details(self) -> List[NodeDetailData]:
+        """
+        Get all node details
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            cursor = client_data['collections']['node_details'].find({})
+            results = []
+            async for doc in cursor:
+                doc["id"] = str(doc["_id"])
+                results.append(NodeDetailData.model_validate(doc))
+            return results
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error getting all node details: {str(e)}")
+            return []
+
+    async def get_node_details_by_category(self, category: str) -> List[NodeDetailData]:
+        """
+        Get node details by category (Trigger, Action, Condition, Delay)
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            cursor = client_data['collections']['node_details'].find({"category": category})
+            results = []
+            async for doc in cursor:
+                doc["id"] = str(doc["_id"])
+                results.append(NodeDetailData.model_validate(doc))
+            return results
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error getting node details by category: {str(e)}")
+            return []
+
+    async def update_node_detail(self, node_id: str, node_detail: NodeDetailData) -> Optional[NodeDetailData]:
+        """
+        Update a node detail by node_id
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            node_dict = node_detail.model_dump(exclude={"id"})
+            node_dict["updated_at"] = datetime.utcnow()
+            result = await client_data['collections']['node_details'].find_one_and_update(
+                {"node_id": node_id},
+                {"$set": node_dict},
+                return_document=True
+            )
+            if result is None:
+                return None
+            result["id"] = str(result["_id"])
+            return NodeDetailData.model_validate(result)
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error updating node detail: {str(e)}")
+            return None
+
+    async def delete_node_detail(self, node_id: str) -> bool:
+        """
+        Delete a node detail by node_id
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            result = await client_data['collections']['node_details'].delete_one({"node_id": node_id})
+            return result.deleted_count > 0
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error deleting node detail: {str(e)}")
+            return False
+
+    async def upsert_node_detail(self, node_detail: NodeDetailData) -> Optional[NodeDetailData]:
+        """
+        Insert or update a node detail (upsert operation)
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            node_dict = node_detail.model_dump(exclude={"id"})
+            node_dict["updated_at"] = datetime.utcnow()
+            
+            # Check if node exists
+            existing = await client_data['collections']['node_details'].find_one({"node_id": node_detail.node_id})
+            if existing:
+                # Update existing
+                result = await client_data['collections']['node_details'].find_one_and_update(
+                    {"node_id": node_detail.node_id},
+                    {"$set": node_dict},
+                    return_document=True
+                )
+            else:
+                # Insert new
+                node_dict["created_at"] = datetime.utcnow()
+                result = await client_data['collections']['node_details'].insert_one(node_dict)
+                if result.inserted_id:
+                    node_dict["_id"] = result.inserted_id
+                    result = node_dict
+            
+            if result:
+                result["id"] = str(result["_id"])
+                return NodeDetailData.model_validate(result)
+            return None
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error upserting node detail: {str(e)}")
+            return None
+    
+    # User Transaction CRUD operations
+    async def save_user_transaction(self, transaction: "UserTransactionData") -> Optional["UserTransactionData"]:
+        """
+        Save a user transaction to the database.
+        
+        Args:
+            transaction: UserTransactionData object to save
+        
+        Returns:
+            Saved UserTransactionData with ID, or None if save failed
+        """
+        from models.user_transaction_data import UserTransactionData
+        
+        client_data = self._get_client_for_current_loop()
+        try:
+            transaction_dict = transaction.model_dump(exclude={"id"})
+            result = await client_data['collections']['user_transactions'].insert_one(transaction_dict)
+            if result.inserted_id is None:
+                self.log_util.error(service_name="FlowDB", message="Failed to save user transaction")
+                return None
+            transaction_dict["id"] = str(result.inserted_id)
+            transaction_dict["_id"] = result.inserted_id
+            return UserTransactionData.model_validate(transaction_dict)
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error saving user transaction: {str(e)}")
+            return None
+    
+    async def get_transaction_counts_by_node(self, flow_id: str) -> Dict[str, int]:
+        """
+        Get transaction counts grouped by node_id for a specific flow_id.
+        
+        Args:
+            flow_id: Flow ID to get transaction counts for
+        
+        Returns:
+            Dictionary mapping node_id to transaction count
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            # Use MongoDB aggregation to group by node_id and count
+            pipeline = [
+                {"$match": {"flow_id": flow_id}},
+                {"$group": {
+                    "_id": "$node_id",
+                    "count": {"$sum": 1}
+                }}
+            ]
+            
+            cursor = client_data['collections']['user_transactions'].aggregate(pipeline)
+            counts = {}
+            async for doc in cursor:
+                node_id = doc["_id"]
+                count = doc["count"]
+                counts[node_id] = count
+            
+            return counts
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error getting transaction counts by node: {str(e)}")
+            return {}
+    
+    # Delay CRUD operations
+    async def save_delay(self, delay: "DelayData") -> Optional["DelayData"]:
+        """
+        Save a delay record to the database.
+        
+        Args:
+            delay: DelayData object to save
+        
+        Returns:
+            Saved DelayData with ID, or None if save failed
+        """
+        from models.delay_data import DelayData
+        
+        client_data = self._get_client_for_current_loop()
+        try:
+            delay_dict = delay.model_dump(exclude={"id"})
+            result = await client_data['collections']['delays'].insert_one(delay_dict)
+            if result.inserted_id is None:
+                self.log_util.error(service_name="FlowDB", message="Failed to save delay")
+                return None
+            delay_dict["id"] = str(result.inserted_id)
+            delay_dict["_id"] = result.inserted_id
+            return DelayData.model_validate(delay_dict)
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error saving delay: {str(e)}")
+            return None
+    
+    async def get_pending_delays(self) -> List["DelayData"]:
+        """
+        Get all pending delays that need to be processed (not processed and delay_completes_at <= now).
+        
+        Returns:
+            List of DelayData objects that are ready to be processed
+        """
+        from models.delay_data import DelayData
+        
+        client_data = self._get_client_for_current_loop()
+        try:
+            now = datetime.utcnow()
+            cursor = client_data['collections']['delays'].find({
+                "processed": False,
+                "delay_completes_at": {"$lte": now}
+            })
+            results = []
+            async for doc in cursor:
+                doc["id"] = str(doc["_id"])
+                results.append(DelayData.model_validate(doc))
+            return results
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error getting pending delays: {str(e)}")
+            return []
+    
+    async def mark_delay_as_processed(self, delay_id: str) -> bool:
+        """
+        Mark a delay as processed after delay_complete webhook is sent.
+        
+        Args:
+            delay_id: Delay record ID
+        
+        Returns:
+            True if updated successfully, False otherwise
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            from bson import ObjectId
+            result = await client_data['collections']['delays'].update_one(
+                {"_id": ObjectId(delay_id)},
+                {
+                    "$set": {
+                        "processed": True,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error marking delay as processed: {str(e)}")
+            return False
 

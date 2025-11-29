@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, Discriminator
+from pydantic import BaseModel, Field, Discriminator, ConfigDict
 from typing import Optional, List, Dict, Any, Union, Literal, Annotated
 from datetime import datetime
 
@@ -13,7 +13,9 @@ class FlowReply(BaseModel):
     mimeType: Optional[str] = ""
 
 class AnswerValidation(BaseModel):
-    type: str
+    model_config = ConfigDict(extra='allow')  # Allow extra fields
+    
+    type: Optional[str] = None
     minValue: Optional[str] = ""
     maxValue: Optional[str] = ""
     regex: Optional[str] = ""
@@ -37,12 +39,16 @@ class FlowNodeCondition(BaseModel):
     variable: str
     value: str
 
-class ConditionResult(BaseModel):
-    yResultNodeId: str
-    nResultNodeId: str
+class ConditionResultItem(BaseModel):
+    id: str
+    expectedInput: str
+    isDefault: bool
+    nodeResultId: str
 
 # Base FlowNode with common fields
 class BaseFlowNode(BaseModel):
+    model_config = ConfigDict(extra='allow')  # Allow extra fields like 'channel', 'terminal', etc.
+    
     id: str
     type: str
     flowNodeType: str
@@ -69,9 +75,9 @@ class MessageNode(BaseFlowNode):
 # Question Node
 class QuestionNode(BaseFlowNode):
     type: Literal["question"]
-    flowReplies: List[FlowReply]
+    flowReplies: Optional[List[FlowReply]] = []
     userInputVariable: str = ""
-    answerValidation: AnswerValidation
+    answerValidation: Optional[AnswerValidation] = None
     isMediaAccepted: bool = False
 
 # Button Question Node
@@ -87,17 +93,32 @@ class ButtonQuestionNode(BaseFlowNode):
 # List Question Node
 class ListQuestionNode(BaseFlowNode):
     type: Literal["list_question"]
-    flowReplies: List[FlowReply]
+    flowReplies: Optional[List[FlowReply]] = []
     userInputVariable: str = ""
-    answerValidation: AnswerValidation
+    answerValidation: Optional[AnswerValidation] = None
     isMediaAccepted: bool = False
 
 # Condition Node
 class ConditionNode(BaseFlowNode):
     type: Literal["condition"]
     flowNodeConditions: List[FlowNodeCondition]
-    conditionResult: ConditionResult
+    conditionResult: List[ConditionResultItem]  # Array format from frontend
     conditionOperator: str
+
+# Delay Node
+class DelayResultItem(BaseModel):
+    id: str
+    expectedInput: str
+    isDefault: bool
+    nodeResultId: str
+
+class DelayNode(BaseFlowNode):
+    type: Literal["delay"]
+    delayDuration: int  # Duration in seconds
+    delayUnit: str  # "seconds", "minutes", "hours", "days"
+    waitForReply: Optional[bool] = False  # If true, wait for reply; if false, proceed after delay
+    delayInterrupt: Optional[bool] = False  # If true, delay can be interrupted by user reply
+    delayResult: Optional[List[DelayResultItem]] = None  # Array format from frontend
 
 # Union of all node types with discriminator
 FlowNode = Annotated[
@@ -108,7 +129,8 @@ FlowNode = Annotated[
         QuestionNode,
         ButtonQuestionNode,
         ListQuestionNode,
-        ConditionNode
+        ConditionNode,
+        DelayNode
     ],
     Discriminator("type")
 ]
@@ -132,6 +154,7 @@ class FlowData(BaseModel):
     lastUpdated: Optional[str] = None
     transform: Optional[Transform] = None
     isPro: Optional[bool] = False
+    status: Optional[str] = Field(default="draft", description="Flow status: draft, published, etc.")
     brand_id: Optional[int] = None
     user_id: Optional[int] = None
     created_at: Optional[datetime] = Field(default_factory=datetime.utcnow)

@@ -19,10 +19,16 @@ from services.internal.brand_service import BrandService
 from services.flow_service import FlowService
 from services.user_state_service import UserStateService
 from services.webhook_service import WebhookService
+from services.trigger_identification_service import TriggerIdentificationService
+from services.time_triggered_automation_service import TimeTriggeredAutomationService
+from services.reply_validation_service import ReplyValidationService
+from services.node_identification_service import NodeIdentificationService
+from services.whatsapp_flow_service import WhatsAppFlowService
 
 # APIs
 from apis.flow_api import create_flow_api
 from apis.webhook_message_api import create_webhook_message_api
+from apis.node_detail_api import create_node_detail_api
 
 # Utils
 log_util = LogUtil()
@@ -44,16 +50,80 @@ flow_service = FlowService(
     brand_service=brand_service
 )
 
+# Initialize ReplyValidationService
+reply_validation_service = ReplyValidationService(
+    log_util=log_util,
+    flow_db=flow_db
+)
+
+# Initialize WhatsAppFlowService
+whatsapp_flow_service = WhatsAppFlowService(
+    log_util=log_util,
+    flow_db=flow_db,
+    node_process_api_url=None  # Will be set from environment if needed
+)
+
+# Initialize ProcessInternalNodeService
+from services.process_internal_node_service import ProcessInternalNodeService
+process_internal_node_service = ProcessInternalNodeService(
+    log_util=log_util,
+    flow_db=flow_db
+)
+
+# Initialize UserTransactionService
+from services.user_transaction_service import UserTransactionService
+user_transaction_service = UserTransactionService(
+    log_util=log_util,
+    flow_db=flow_db
+)
+
+# Initialize NodeIdentificationService
+node_identification_service = NodeIdentificationService(
+    log_util=log_util,
+    flow_db=flow_db,
+    whatsapp_flow_service=whatsapp_flow_service,
+    process_internal_node_service=process_internal_node_service,
+    user_transaction_service=user_transaction_service
+)
+
 user_state_service = UserStateService(
     log_util=log_util,
     flow_db=flow_db,
-    flow_service=flow_service
+    flow_service=flow_service,
+    node_identification_service=node_identification_service,
+    reply_validation_service=reply_validation_service
+)
+
+trigger_identification_service = TriggerIdentificationService(
+    log_util=log_util,
+    flow_db=flow_db,
+    flow_service=flow_service,
+    user_state_service=user_state_service
+)
+
+# Set trigger service in user state service
+user_state_service.set_trigger_identification_service(trigger_identification_service)
+
+# Time-triggered automation service for scheduled triggers
+time_triggered_automation_service = TimeTriggeredAutomationService(
+    log_util=log_util,
+    flow_db=flow_db
 )
 
 webhook_service = WebhookService(
     log_util=log_util,
     flow_db=flow_db,
-    user_state_service=user_state_service
+    user_state_service=user_state_service,
+    time_triggered_automation_service=time_triggered_automation_service
+)
+
+# Initialize Delay Scheduler Service
+from services.delay_scheduler_service import DelaySchedulerService
+delay_scheduler_service = DelaySchedulerService(
+    log_util=log_util,
+    flow_db=flow_db,
+    webhook_service=webhook_service,
+    check_interval_seconds=20  # Check every 20 seconds
 )
 
 # Define lifespan function
@@ -61,9 +131,18 @@ webhook_service = WebhookService(
 async def lifespan(app: FastAPI):
     # Startup
     log_util.info(service_name="FlowService", message="Application startup complete")
+    
+    # Start delay scheduler
+    await delay_scheduler_service.start()
+    log_util.info(service_name="FlowService", message="Delay scheduler started")
+    
     yield
     
     # Shutdown
+    # Stop delay scheduler
+    await delay_scheduler_service.stop()
+    log_util.info(service_name="FlowService", message="Delay scheduler stopped")
+    
     flow_db.close()
     log_util.info(service_name="FlowService", message="Application shutdown complete")
 
@@ -105,6 +184,13 @@ webhook_message_router = create_webhook_message_api(
     webhook_service=webhook_service
 )
 app.include_router(webhook_message_router)
+
+# Node details API
+node_detail_router = create_node_detail_api(
+    log_util=log_util,
+    flow_db=flow_db
+)
+app.include_router(node_detail_router)
 
 # Health check endpoint
 @app.get("/health")
