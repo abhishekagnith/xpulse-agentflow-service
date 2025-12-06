@@ -17,6 +17,7 @@ class ProcessNodeRequest(BaseModel):
     user_identifier: str  # Phone number for WhatsApp, email for Email, etc.
     brand_id: int
     user_id: int
+    lead_id: Optional[str] = None  # Optional lead ID from lead management service
     
     # Channel information
     channel: str  # "whatsapp", "email", "sms", "facebook", etc.
@@ -46,6 +47,7 @@ class ProcessNodeRequest(BaseModel):
                 "user_identifier": "1234567890",
                 "brand_id": 1,
                 "user_id": 1,
+                "lead_id": "lead_12345",
                 "channel": "whatsapp",
                 "fallback_message": None,
                 "user_state": {

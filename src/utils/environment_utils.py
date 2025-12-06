@@ -26,7 +26,7 @@ class EnvironmentUtils:
             "MONGO_USERNAME": os.getenv("MONGO_USERNAME", "agentflowservice"),
             "MONGO_PASSWORD": os.getenv("MONGO_PASSWORD", "4g3ntfL0wuS3r"),
             "MONGO_AUTH_SOURCE": os.getenv("MONGO_AUTH_SOURCE", "admin"),
-            "MONGO_HOST": os.getenv("MONGO_HOST", "143.244.131.181"),
+            "MONGO_HOST": os.getenv("MONGO_HOST", "157.245.98.53"),
             "MONGO_PORT": int(os.getenv("MONGO_PORT", "27017")),
             "MONGO_DB_NAME": os.getenv("MONGO_DB_NAME", "flow_db"),
             "DEBUG": os.getenv("DEBUG", "false"),

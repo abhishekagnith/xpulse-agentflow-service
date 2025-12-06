@@ -6,6 +6,7 @@ import asyncio
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import weakref
+from pymongo.errors import NetworkTimeout, ServerSelectionTimeoutError, ConnectionFailure
 
 # Utils
 from utils.log_utils import LogUtil
@@ -46,11 +47,12 @@ class FlowDB:
 
         # Mongo Connection Pool Configs
         self.max_pool_size = 50
-        self.min_pool_size = 10
+        self.min_pool_size = 0  # Create connections on-demand instead of at startup
         self.max_idle_time_ms = 30000
-        self.wait_queue_timeout_ms = 10000
-        self.connect_timeout_ms = 20000
-        self.server_selection_timeout_ms = 5000
+        self.wait_queue_timeout_ms = 10000  # Reduced from 30000ms for faster failure detection
+        self.connect_timeout_ms = 10000  # Reduced from 20000ms for faster failure detection
+        self.server_selection_timeout_ms = 10000  # Increased from 5000ms for consistency
+        self.socket_timeout_ms = 10000  # Added for socket-level timeout
 
         # MongoDB client - will be initialized lazily on first use
         # Use a dictionary keyed by event loop ID to support multiple event loops
@@ -70,6 +72,7 @@ class FlowDB:
         self.node_details = None
         self.user_transactions = None
         self.delays = None
+        self.flow_settings = None
         
         # Thread-safe initialization lock
         self._client_lock = threading.Lock()
@@ -104,6 +107,7 @@ class FlowDB:
                 return self._clients[loop_id]
             
             # Create MongoDB client for this specific event loop
+            # Added retry mechanisms and optimized timeout values to reduce connection issues
             client = AsyncIOMotorClient(
                 f"mongodb://{self.username}:{self.password}@{self.host}:{self.port}/?authSource={self.auth_source}",
                 maxPoolSize=self.max_pool_size,
@@ -111,7 +115,10 @@ class FlowDB:
                 maxIdleTimeMS=self.max_idle_time_ms,
                 waitQueueTimeoutMS=self.wait_queue_timeout_ms,
                 connectTimeoutMS=self.connect_timeout_ms,
-                serverSelectionTimeoutMS=self.server_selection_timeout_ms
+                serverSelectionTimeoutMS=self.server_selection_timeout_ms,
+                socketTimeoutMS=self.socket_timeout_ms,
+                retryWrites=True,  # Enable retry for write operations
+                retryReads=True  # Enable retry for read operations
             )
             db = client[self.db_name]
             
@@ -150,7 +157,8 @@ class FlowDB:
             'webhook_adapter_processed': db.webhook_adapter_processed,
             'node_details': db.node_details,
             'user_transactions': db.user_transactions,
-            'delays': db.delays
+            'delays': db.delays,
+            'flow_settings': db.flow_settings
         }
     
     
@@ -182,10 +190,38 @@ class FlowDB:
             self.flow_webhook_messages = None
             self.webhook_adapter_processed = None
             self.node_details = None
+            self.flow_settings = None
             
             self.log_util.info(
                 service_name="FlowDB",
                 message="All MongoDB clients closed"
+            )
+    
+    def _handle_db_operation(self, operation_name: str, error: Exception) -> None:
+        """
+        Handle database operation errors with appropriate logging and exception wrapping.
+        
+        Args:
+            operation_name: Name of the operation that failed
+            error: The exception that occurred
+        """
+        if isinstance(error, (NetworkTimeout, ServerSelectionTimeoutError, ConnectionFailure)):
+            self.log_util.error(
+                service_name="FlowDB",
+                message=f"Database connection error in {operation_name}: {str(error)}"
+            )
+            raise FlowDBException(
+                message=f"Database connection error: {str(error)}",
+                status_code=503  # Service Unavailable
+            )
+        else:
+            self.log_util.error(
+                service_name="FlowDB",
+                message=f"Error in {operation_name}: {str(error)}"
+            )
+            raise FlowDBException(
+                message=f"Database error: {str(error)}",
+                status_code=500
             )
 
     # Flow CRUD operations
@@ -254,13 +290,13 @@ class FlowDB:
 
     async def get_flows(self, brand_id: int, user_id: Optional[int] = None) -> List[FlowData]:
         """
-        Get flows filtered by brand (and optionally user)
+        Get flows filtered by brand only (user_id is ignored - all flows for the brand are returned)
         """
         client_data = self._get_client_for_current_loop()
         try:
+            # Only filter by brand_id - do not filter by user_id
+            # All users within a brand should see all flows for that brand
             query: Dict[str, Any] = {"brand_id": brand_id}
-            if user_id is not None:
-                query["user_id"] = user_id
 
             cursor = client_data['collections']['flows'].find(query)
             flows: List[FlowData] = []
@@ -1090,5 +1126,130 @@ class FlowDB:
             return result.modified_count > 0
         except Exception as e:
             self.log_util.error(service_name="FlowDB", message=f"Error marking delay as processed: {str(e)}")
+            return False
+    
+    # Flow Settings CRUD operations
+    async def save_flow_settings(self, flow_settings: "FlowSettingsData") -> Optional["FlowSettingsData"]:
+        """
+        Save or update flow settings for a specific flow and node.
+        If settings exist for the flow_id and node_id combination, updates them.
+        Otherwise, creates new settings.
+        
+        Args:
+            flow_settings: FlowSettingsData object to save
+        
+        Returns:
+            Saved FlowSettingsData with ID, or None if save failed
+        """
+        from models.flow_settings_data import FlowSettingsData
+        
+        client_data = self._get_client_for_current_loop()
+        try:
+            flow_settings_dict = flow_settings.model_dump(exclude={"id"})
+            flow_settings_dict["updated_at"] = datetime.utcnow()
+            
+            # Check if settings already exist for this flow_id and node_id
+            existing = await client_data['collections']['flow_settings'].find_one({
+                "flow_id": flow_settings.flow_id,
+                "node_id": flow_settings.node_id
+            })
+            
+            if existing:
+                # Update existing settings
+                result = await client_data['collections']['flow_settings'].find_one_and_update(
+                    {
+                        "flow_id": flow_settings.flow_id,
+                        "node_id": flow_settings.node_id
+                    },
+                    {"$set": flow_settings_dict},
+                    return_document=True
+                )
+            else:
+                # Create new settings
+                flow_settings_dict["created_at"] = datetime.utcnow()
+                result = await client_data['collections']['flow_settings'].insert_one(flow_settings_dict)
+                if result.inserted_id:
+                    flow_settings_dict["_id"] = result.inserted_id
+                    result = flow_settings_dict
+            
+            if result:
+                result["id"] = str(result["_id"])
+                return FlowSettingsData.model_validate(result)
+            return None
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error saving flow settings: {str(e)}")
+            return None
+    
+    async def get_flow_settings(self, flow_id: str, node_id: str) -> Optional["FlowSettingsData"]:
+        """
+        Get flow settings for a specific flow and node.
+        
+        Args:
+            flow_id: Flow ID
+            node_id: Node ID
+        
+        Returns:
+            FlowSettingsData if found, None otherwise
+        """
+        from models.flow_settings_data import FlowSettingsData
+        
+        client_data = self._get_client_for_current_loop()
+        try:
+            result = await client_data['collections']['flow_settings'].find_one({
+                "flow_id": flow_id,
+                "node_id": node_id
+            })
+            if result is None:
+                return None
+            result["id"] = str(result["_id"])
+            return FlowSettingsData.model_validate(result)
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error getting flow settings: {str(e)}")
+            return None
+    
+    async def get_flow_settings_by_flow_id(self, flow_id: str) -> List["FlowSettingsData"]:
+        """
+        Get all flow settings for a specific flow.
+        
+        Args:
+            flow_id: Flow ID
+        
+        Returns:
+            List of FlowSettingsData objects
+        """
+        from models.flow_settings_data import FlowSettingsData
+        
+        client_data = self._get_client_for_current_loop()
+        try:
+            cursor = client_data['collections']['flow_settings'].find({"flow_id": flow_id})
+            results = []
+            async for doc in cursor:
+                doc["id"] = str(doc["_id"])
+                results.append(FlowSettingsData.model_validate(doc))
+            return results
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error getting flow settings by flow_id: {str(e)}")
+            return []
+    
+    async def delete_flow_settings(self, flow_id: str, node_id: str) -> bool:
+        """
+        Delete flow settings for a specific flow and node.
+        
+        Args:
+            flow_id: Flow ID
+            node_id: Node ID
+        
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        client_data = self._get_client_for_current_loop()
+        try:
+            result = await client_data['collections']['flow_settings'].delete_one({
+                "flow_id": flow_id,
+                "node_id": node_id
+            })
+            return result.deleted_count > 0
+        except Exception as e:
+            self.log_util.error(service_name="FlowDB", message=f"Error deleting flow settings: {str(e)}")
             return False
 

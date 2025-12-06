@@ -12,6 +12,7 @@ from models.webhook_message_data import WebhookMetadata
 
 if TYPE_CHECKING:
     from services.whatsapp_flow_service import WhatsAppFlowService
+    from services.gmail_flow_service import GmailFlowService
     from services.process_internal_node_service import ProcessInternalNodeService
     from services.user_transaction_service import UserTransactionService
 
@@ -27,12 +28,14 @@ class NodeIdentificationService:
         log_util: LogUtil,
         flow_db: FlowDB,
         whatsapp_flow_service: "WhatsAppFlowService",
+        gmail_flow_service: Optional["GmailFlowService"] = None,
         process_internal_node_service: Optional["ProcessInternalNodeService"] = None,
         user_transaction_service: Optional["UserTransactionService"] = None
     ):
         self.log_util = log_util
         self.flow_db = flow_db
         self.whatsapp_flow_service = whatsapp_flow_service
+        self.gmail_flow_service = gmail_flow_service
         self.process_internal_node_service = process_internal_node_service
         self.user_transaction_service = user_transaction_service
     
@@ -287,7 +290,8 @@ class NodeIdentificationService:
                         channel=channel,
                         fallback_message=fallback_message,
                         is_validation_error=True,
-                        user_state={}
+                        user_state={},
+                        lead_id=lead_id
                     )
                     
                     if node_result.get("status") != "success":
@@ -359,12 +363,41 @@ class NodeIdentificationService:
                     }
             
             # STEP 7: Process the node via node process API
-            # Only call WhatsAppFlowService if channel is "whatsapp"
-            if channel == "whatsapp":
+            # Handle different node types and channels appropriately
+            # Check node type first - email template nodes should be processed by GmailFlowService regardless of channel
+            next_node_type = next_node_data.get("type") if next_node_data else None
+            
+            if next_node_type == "send_email_template" and self.gmail_flow_service:
+                # Process send_email_template nodes via GmailFlowService (regardless of trigger channel)
+                self.log_util.info(
+                    service_name="NodeIdentificationService",
+                    message=f"[IDENTIFY_NODE] Processing send_email_template node (channel={channel}): next_node_id={next_node_id}"
+                )
+                
+                # Get user_detail for lead_id extraction
+                user_detail_dict = user_detail if user_detail else {}
+                
+                # Process email template node
+                node_result = await self.gmail_flow_service.process_email_template_node(
+                    flow=flow,
+                    node_data=next_node_data,
+                    user_identifier=user_identifier,
+                    brand_id=brand_id,
+                    user_id=user_id,
+                    lead_id=lead_id
+                )
+                
+                if node_result.get("status") != "success":
+                    return {
+                        "status": "error",
+                        "message": node_result.get("message", "Email template processing failed"),
+                        "next_node_id": None
+                    }
+            elif channel == "whatsapp":
                 # Use empty dict for user_state - node processing doesn't require user state
                 self.log_util.info(
                     service_name="NodeIdentificationService",
-                    message=f"[IDENTIFY_NODE] Calling node process API: next_node_id={next_node_id}, next_node_type={next_node_data.get('type') if next_node_data else None}, is_validation_error={is_validation_error}, fallback_message={'present' if fallback_message else 'None'}"
+                    message=f"[IDENTIFY_NODE] Calling node process API: next_node_id={next_node_id}, next_node_type={next_node_type}, is_validation_error={is_validation_error}, fallback_message={'present' if fallback_message else 'None'}"
                 )
                 node_result = await self.whatsapp_flow_service.call_node_process_api(
                     flow=flow,
@@ -377,7 +410,8 @@ class NodeIdentificationService:
                     channel=channel,
                     fallback_message=fallback_message,
                     is_validation_error=is_validation_error,
-                    user_state={}  # Empty dict - user state not needed for node processing
+                    user_state={},  # Empty dict - user state not needed for node processing
+                    lead_id=lead_id
                 )
                 
                 if node_result.get("status") != "success":
@@ -386,13 +420,20 @@ class NodeIdentificationService:
                         "message": node_result.get("message", "Node processing failed"),
                         "next_node_id": None
                     }
-            else:
-                # For non-WhatsApp channels, skip WhatsAppFlowService
+            elif channel == "email" or channel == "gmail":
+                # Handle other email channel node types (non-send_email_template)
                 self.log_util.info(
                     service_name="NodeIdentificationService",
-                    message=f"[IDENTIFY_NODE] Skipping WhatsAppFlowService for channel={channel}, next_node_id={next_node_id}"
+                    message=f"[IDENTIFY_NODE] Skipping email node processing for channel={channel}, next_node_type={next_node_type}, next_node_id={next_node_id}"
                 )
-                # Return success without calling WhatsAppFlowService
+                # Return success - other email node types may be handled by email service directly
+            else:
+                # For other channels, skip channel-specific processing
+                self.log_util.info(
+                    service_name="NodeIdentificationService",
+                    message=f"[IDENTIFY_NODE] Skipping channel-specific processing for channel={channel}, next_node_id={next_node_id}"
+                )
+                # Return success without calling channel-specific services
                 # Other channel services should handle node processing separately
             
             # STEP 9: Note - User state update is handled by UserStateService, not here

@@ -131,7 +131,8 @@ class WhatsAppFlowService:
         channel: str = "whatsapp",
         fallback_message: Optional[str] = None,
         is_validation_error: bool = False,
-        user_state: Optional[Dict[str, Any]] = None
+        user_state: Optional[Dict[str, Any]] = None,
+        lead_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Call the node process API endpoint to send node to channel service
@@ -157,6 +158,7 @@ class WhatsAppFlowService:
                 user_identifier=user_identifier,
                 brand_id=brand_id,
                 user_id=user_id,
+                lead_id=lead_id,
                 channel=channel,
                 fallback_message=fallback_message,
                 is_validation_error=is_validation_error,

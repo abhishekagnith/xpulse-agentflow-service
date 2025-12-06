@@ -63,6 +63,15 @@ whatsapp_flow_service = WhatsAppFlowService(
     node_process_api_url=None  # Will be set from environment if needed
 )
 
+# Initialize GmailFlowService
+from services.gmail_flow_service import GmailFlowService
+gmail_flow_service = GmailFlowService(
+    log_util=log_util,
+    flow_db=flow_db,
+    environment_utils=environment_utils,
+    email_service_api_url=None  # Will use default if not provided
+)
+
 # Initialize ProcessInternalNodeService
 from services.process_internal_node_service import ProcessInternalNodeService
 process_internal_node_service = ProcessInternalNodeService(
@@ -82,6 +91,7 @@ node_identification_service = NodeIdentificationService(
     log_util=log_util,
     flow_db=flow_db,
     whatsapp_flow_service=whatsapp_flow_service,
+    gmail_flow_service=gmail_flow_service,
     process_internal_node_service=process_internal_node_service,
     user_transaction_service=user_transaction_service
 )

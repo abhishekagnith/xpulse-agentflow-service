@@ -120,6 +120,29 @@ class DelayNode(BaseFlowNode):
     delayInterrupt: Optional[bool] = False  # If true, delay can be interrupted by user reply
     delayResult: Optional[List[DelayResultItem]] = None  # Array format from frontend
 
+# Send Template Node
+class TemplateHeaderValue(BaseModel):
+    type: str  # e.g., "IMAGE", "VIDEO", "DOCUMENT", "TEXT"
+    mediaUrl: Optional[str] = None
+
+class TemplateButtonUrl(BaseModel):
+    buttonIndex: int
+    buttonText: str
+    url: str
+
+class SendTemplateNode(BaseFlowNode):
+    type: Literal["send_template"]
+    triggerTemplateId: str
+    triggerTemplateName: Optional[str] = None
+    templateHeaderValues: Optional[List[TemplateHeaderValue]] = []
+    templateButtonUrls: Optional[List[TemplateButtonUrl]] = []
+
+# Send Email Template Node
+class SendEmailTemplateNode(BaseFlowNode):
+    type: Literal["send_email_template"]
+    emailTemplateMongoId: str
+    emailTemplateName: Optional[str] = None
+
 # Union of all node types with discriminator
 FlowNode = Annotated[
     Union[
@@ -130,7 +153,9 @@ FlowNode = Annotated[
         ButtonQuestionNode,
         ListQuestionNode,
         ConditionNode,
-        DelayNode
+        DelayNode,
+        SendTemplateNode,
+        SendEmailTemplateNode
     ],
     Discriminator("type")
 ]

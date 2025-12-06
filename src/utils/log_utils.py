@@ -38,6 +38,14 @@ class LogUtil:
         console_formatter = logging.Formatter('%(asctime)s - %(name)s - [%(levelname)s] - %(message)s')
         console_handler.setFormatter(console_formatter)
         self.logger.addHandler(console_handler)
+        
+        # Suppress pymongo background task errors (set to WARNING to reduce noise)
+        pymongo_logger = logging.getLogger("pymongo")
+        pymongo_logger.setLevel(logging.WARNING)  # Suppress INFO and DEBUG messages from pymongo
+        
+        # Suppress motor (async pymongo) background task errors
+        motor_logger = logging.getLogger("motor")
+        motor_logger.setLevel(logging.WARNING)  # Suppress INFO and DEBUG messages from motor
 
     def info(self, service_name: str, message: str):
         self.logger.info(f"{message}", extra={"tags": {"service_name": service_name}})
